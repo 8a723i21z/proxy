@@ -19,6 +19,8 @@ struct State {
     last_active: AtomicU64,
     /// Seconds after the last player leaves before the container sleeps.
     sleep_timeout: u64,
+    /// How long to keep retrying the backend connection on a join before giving up.
+    connect_timeout: u64,
 }
 
 fn now_secs() -> u64 {
@@ -46,11 +48,19 @@ async fn main() -> io::Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(600);
+    // How long to keep retrying the backend connection while it boots, on a join.
+    // Note: the Minecraft client's own login read-timeout (~30s) still applies,
+    // so a boot longer than that disconnects the first join regardless.
+    let connect_timeout = std::env::var("CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120);
     let bind_addr = format!("0.0.0.0:{}", port);
 
     println!("Starting proxy on {}", bind_addr);
     println!("Backend: {}", backend_addr);
     println!("Sleep timeout: {}s", sleep_timeout);
+    println!("Connect timeout: {}s", connect_timeout);
     match &motd_online {
         Some(_) => println!("Online MOTD: static (MOTD_ONLINE set)"),
         None => println!("Online MOTD: live passthrough from backend"),
@@ -61,6 +71,7 @@ async fn main() -> io::Result<()> {
         active: AtomicUsize::new(0),
         last_active: AtomicU64::new(0),
         sleep_timeout,
+        connect_timeout,
     });
     let motd = Arc::new(motd);
     let motd_online = Arc::new(motd_online);
@@ -151,7 +162,7 @@ async fn handle_client(
     state.last_active.store(now_secs(), Ordering::Release);
     println!("[join] player joining (state {}), active connections: {}", next_state, current);
 
-    let result = proxy_to_backend(client, backend_addr, &handshake).await;
+    let result = proxy_to_backend(client, backend_addr, &handshake, state.connect_timeout).await;
 
     let current = state.active.fetch_sub(1, Ordering::AcqRel) - 1;
     // Start the idle countdown from the moment this player left.
@@ -254,9 +265,10 @@ async fn proxy_to_backend(
     mut client: TcpStream,
     backend_addr: &str,
     handshake: &[u8],
+    connect_timeout: u64,
 ) -> io::Result<()> {
     println!("[conn] connecting to backend...");
-    let mut server = connect_with_retry(backend_addr).await?;
+    let mut server = connect_with_retry(backend_addr, connect_timeout).await?;
     println!("[conn] backend connected, replaying handshake and proxying");
 
     // The backend never saw the handshake we consumed, so send it first.
@@ -301,8 +313,8 @@ async fn handle_status(client: &mut TcpStream, motd: &str, protocol: i32) -> io:
     Ok(())
 }
 
-async fn connect_with_retry(addr: &str) -> io::Result<TcpStream> {
-    let deadline = Duration::from_secs(60);
+async fn connect_with_retry(addr: &str, deadline_secs: u64) -> io::Result<TcpStream> {
+    let deadline = Duration::from_secs(deadline_secs);
 
     println!("[retry] trying to connect to {}", addr);
 
