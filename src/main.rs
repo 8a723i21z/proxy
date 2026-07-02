@@ -188,7 +188,7 @@ async fn handle_status(client: &mut TcpStream, motd: &str, protocol: i32) -> io:
           \"players\":{{\"max\":0,\"online\":0,\"sample\":[]}},\
           \"description\":{{\"text\":{motd}}}}}",
         protocol = protocol,
-        motd = json_string(motd),
+        motd = json_string(&translate_colors(motd)),
     );
 
     let mut payload = vec![0x00u8]; // Status Response packet id
@@ -319,6 +319,29 @@ fn encode_varint(mut value: u32) -> Vec<u8> {
         if value == 0 {
             break;
         }
+    }
+    out
+}
+
+/// Translate Bukkit-style `&` color/format codes into the section sign (§)
+/// codes the Minecraft protocol actually uses, mirroring Spigot's
+/// translateAlternateColorCodes. `&c&l` -> `§c§l`. This also covers Bungee hex
+/// codes of the form `&x&r&r&g&g&b&b`. An `&` not followed by a valid code is
+/// left untouched, so `&&` and stray ampersands survive.
+fn translate_colors(s: &str) -> String {
+    const CODES: &str = "0123456789abcdefklmnorxABCDEFKLMNORX";
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            if let Some(&next) = chars.peek() {
+                if CODES.contains(next) {
+                    out.push('\u{00A7}');
+                    continue; // the code char itself is pushed next iteration
+                }
+            }
+        }
+        out.push(c);
     }
     out
 }
