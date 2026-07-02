@@ -6,10 +6,15 @@ use tokio::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// How long a join waits for the backend to be reachable before it gives up and
+/// asks the player to rejoin. Only bounds the asleep case; an already-up backend
+/// connects instantly.
+const QUICK_CONNECT_SECS: u64 = 5;
 
 /// Shared runtime state used to decide whether the backend is currently awake.
 struct State {
@@ -21,6 +26,8 @@ struct State {
     sleep_timeout: u64,
     /// How long to keep retrying the backend connection on a join before giving up.
     connect_timeout: u64,
+    /// True while a background task is booting the backend, to avoid piling up.
+    waking: AtomicBool,
 }
 
 fn now_secs() -> u64 {
@@ -55,12 +62,18 @@ async fn main() -> io::Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
+    // Message shown to a player who joins while the backend is still booting.
+    // Supports the same & color/format/hex codes and JSON as MOTD.
+    let startup_message = std::env::var("STARTUP_MESSAGE").unwrap_or_else(|_| {
+        "&e&lServer is starting up!\n&7Please rejoin in a few seconds.".to_string()
+    });
     let bind_addr = format!("0.0.0.0:{}", port);
 
     println!("Starting proxy on {}", bind_addr);
     println!("Backend: {}", backend_addr);
     println!("Sleep timeout: {}s", sleep_timeout);
     println!("Connect timeout: {}s", connect_timeout);
+    println!("Quick-connect window: {}s", QUICK_CONNECT_SECS);
     match &motd_online {
         Some(_) => println!("Online MOTD: static (MOTD_ONLINE set)"),
         None => println!("Online MOTD: live passthrough from backend"),
@@ -72,9 +85,11 @@ async fn main() -> io::Result<()> {
         last_active: AtomicU64::new(0),
         sleep_timeout,
         connect_timeout,
+        waking: AtomicBool::new(false),
     });
     let motd = Arc::new(motd);
     let motd_online = Arc::new(motd_online);
+    let startup_message = Arc::new(startup_message);
 
     {
         let state = state.clone();
@@ -105,9 +120,18 @@ async fn main() -> io::Result<()> {
         let backend_addr = backend_addr.clone();
         let motd = motd.clone();
         let motd_online = motd_online.clone();
+        let startup_message = startup_message.clone();
 
         tokio::spawn(async move {
-            let res = handle_client(client, &backend_addr, &motd, motd_online.as_deref(), state).await;
+            let res = handle_client(
+                client,
+                &backend_addr,
+                &motd,
+                motd_online.as_deref(),
+                &startup_message,
+                state,
+            )
+            .await;
             if let Err(e) = res {
                 eprintln!("[conn] error from {}: {}", addr, e);
             }
@@ -120,6 +144,7 @@ async fn handle_client(
     backend_addr: &str,
     motd: &str,
     motd_online: Option<&str>,
+    startup_message: &str,
     state: Arc<State>,
 ) -> io::Result<()> {
     // First packet on every connection is the Handshake. Read it whole so we
@@ -157,12 +182,12 @@ async fn handle_client(
         return Ok(());
     }
 
-    // next_state == 2 (login) or 3 (transfer): a real join. Wake the backend.
+    // next_state == 2 (login) or 3 (transfer): a real join.
     let current = state.active.fetch_add(1, Ordering::AcqRel) + 1;
     state.last_active.store(now_secs(), Ordering::Release);
     println!("[join] player joining (state {}), active connections: {}", next_state, current);
 
-    let result = proxy_to_backend(client, backend_addr, &handshake, state.connect_timeout).await;
+    let result = handle_join(client, backend_addr, &handshake, &state, startup_message).await;
 
     let current = state.active.fetch_sub(1, Ordering::AcqRel) - 1;
     // Start the idle countdown from the moment this player left.
@@ -170,6 +195,69 @@ async fn handle_client(
     println!("[join] connection ended, active: {}", current);
 
     result
+}
+
+/// Handle a join. If the backend is reachable quickly, proxy straight through.
+/// Otherwise trigger its boot in the background and politely disconnect the
+/// player with a "starting up" message so they don't hit the client timeout.
+async fn handle_join(
+    mut client: TcpStream,
+    backend_addr: &str,
+    handshake: &[u8],
+    state: &Arc<State>,
+    startup_message: &str,
+) -> io::Result<()> {
+    match timeout(Duration::from_secs(QUICK_CONNECT_SECS), TcpStream::connect(backend_addr)).await {
+        Ok(Ok(mut server)) => {
+            // Backend already up: replay the handshake and proxy through.
+            println!("[join] backend reachable, proxying");
+            server.write_all(&frame(handshake)).await?;
+            match io::copy_bidirectional(&mut client, &mut server).await {
+                Ok((c2s, s2c)) => {
+                    println!("[conn] closed (client->server {} bytes, server->client {} bytes)", c2s, s2c);
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("[conn] proxy error: {}", e);
+                    Err(e)
+                }
+            }
+        }
+        _ => {
+            // Backend asleep/booting: kick off the boot and ask the player to rejoin.
+            println!("[join] backend not ready, waking it and asking client to rejoin");
+            ensure_waking(backend_addr, state);
+            send_login_disconnect(&mut client, startup_message).await
+        }
+    }
+}
+
+/// Spawn a background task that boots the backend, unless one is already running.
+/// The connection is only used to wake the container and is dropped once up.
+fn ensure_waking(backend_addr: &str, state: &Arc<State>) {
+    if state.waking.swap(true, Ordering::AcqRel) {
+        return; // a wake task is already in progress
+    }
+    let backend_addr = backend_addr.to_string();
+    let state = state.clone();
+    tokio::spawn(async move {
+        println!("[wake] triggering backend boot...");
+        match connect_with_retry(&backend_addr, state.connect_timeout).await {
+            Ok(_) => println!("[wake] backend is up"),
+            Err(e) => println!("[wake] backend failed to wake: {}", e),
+        }
+        state.waking.store(false, Ordering::Release);
+    });
+}
+
+/// Send a clientbound Login Disconnect (0x00) with a styled reason, so the
+/// player sees a friendly message instead of a raw timeout.
+async fn send_login_disconnect(client: &mut TcpStream, message: &str) -> io::Result<()> {
+    let json = motd_component(message).to_string();
+    let mut payload = vec![0x00u8]; // Login Disconnect packet id
+    payload.extend_from_slice(&frame(json.as_bytes())); // Reason: String (chat JSON)
+    client.write_all(&frame(&payload)).await?;
+    Ok(())
 }
 
 /// True if the backend is believed to be awake: either a player is connected
@@ -258,31 +346,6 @@ fn override_description(backend_json: &str, motd: &str) -> String {
             value.to_string()
         }
         Err(_) => backend_json.to_string(),
-    }
-}
-
-async fn proxy_to_backend(
-    mut client: TcpStream,
-    backend_addr: &str,
-    handshake: &[u8],
-    connect_timeout: u64,
-) -> io::Result<()> {
-    println!("[conn] connecting to backend...");
-    let mut server = connect_with_retry(backend_addr, connect_timeout).await?;
-    println!("[conn] backend connected, replaying handshake and proxying");
-
-    // The backend never saw the handshake we consumed, so send it first.
-    server.write_all(&frame(handshake)).await?;
-
-    match io::copy_bidirectional(&mut client, &mut server).await {
-        Ok((c2s, s2c)) => {
-            println!("[conn] closed (client->server {} bytes, server->client {} bytes)", c2s, s2c);
-            Ok(())
-        }
-        Err(e) => {
-            println!("[conn] proxy error: {}", e);
-            Err(e)
-        }
     }
 }
 
@@ -455,6 +518,8 @@ fn motd_component(motd: &str) -> serde_json::Value {
 /// Parse `&`/`§` color, hex, and format codes into a `{text,extra:[...]}`
 /// component with one run per style change.
 fn parse_legacy_motd(motd: &str) -> serde_json::Value {
+    // Let a literal "\n" in env vars mean a line break (env can't hold a real one).
+    let motd = motd.replace("\\n", "\n");
     let chars: Vec<char> = motd.chars().collect();
     let mut runs: Vec<serde_json::Value> = Vec::new();
     let mut buf = String::new();
