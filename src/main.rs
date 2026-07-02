@@ -123,22 +123,17 @@ async fn handle_client(
         // if the last player left less than `sleep_timeout` ago (the container
         // hasn't hit its idle-sleep yet). Only then do we probe it.
         if backend_awake(&state) {
-            match motd_online {
-                // Static online MOTD configured: answer locally, no probe.
-                Some(text) => {
-                    println!("[status] backend online, serving static MOTD_ONLINE");
-                    handle_status(&mut client, text, protocol).await?;
-                    return Ok(());
-                }
-                // Default: relay the backend's real status (live MOTD/count).
-                None => {
-                    println!("[status] backend online, relaying real MOTD from backend");
-                    if relay_status(&mut client, backend_addr, &handshake).await.is_ok() {
-                        return Ok(());
-                    }
+            // Fetch the backend's real status so the client sees the live player
+            // count/version. If MOTD_ONLINE is set we swap in that description but
+            // keep the real numbers; otherwise the backend's status is passed
+            // through unchanged.
+            println!("[status] backend online, fetching real status from backend");
+            match serve_online_status(&mut client, backend_addr, &handshake, motd_online).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
                     // Probe failed: the container has actually slept. Mark it
                     // offline so we stop probing until the next real join.
-                    println!("[status] relay failed, marking offline and serving sleeping MOTD");
+                    println!("[status] backend probe failed ({}), serving sleeping MOTD", e);
                     if state.active.load(Ordering::Acquire) == 0 {
                         state.last_active.store(0, Ordering::Release);
                     }
@@ -176,28 +171,84 @@ fn backend_awake(state: &State) -> bool {
     last != 0 && now_secs().saturating_sub(last) < state.sleep_timeout
 }
 
-/// Relay a status ping to the backend and pipe its real response back to the
-/// client. Only called while the backend is believed awake (see `backend_awake`),
-/// so the connect below should hit a running container rather than wake a
-/// sleeping one. Uses a short timeout: if the backend doesn't answer quickly the
-/// caller falls back to the local sleeping MOTD rather than hanging the client's
-/// server list.
-async fn relay_status(
+/// Serve a status ping using the backend's real status (live player count and
+/// version). Only called while the backend is believed awake (see
+/// `backend_awake`), so the probe should hit a running container rather than
+/// wake a sleeping one. If `motd_online` is set, its text replaces the backend's
+/// description while the real player count is preserved. Returns an error (so the
+/// caller falls back to the offline MOTD) if the backend can't be reached.
+async fn serve_online_status(
     client: &mut TcpStream,
     backend_addr: &str,
     handshake: &[u8],
+    motd_online: Option<&str>,
 ) -> io::Result<()> {
+    // Consume the client's Status Request (0x00, empty) before replying.
+    let _req = read_packet(client).await?;
+
+    let backend_json = fetch_backend_status(backend_addr, handshake).await?;
+
+    // Optionally swap the description for MOTD_ONLINE, keeping real player count.
+    let json = match motd_online {
+        Some(text) => override_description(&backend_json, text),
+        None => backend_json,
+    };
+
+    let mut payload = vec![0x00u8]; // Status Response packet id
+    payload.extend_from_slice(&frame(json.as_bytes()));
+    client.write_all(&frame(&payload)).await?;
+
+    // Echo the Ping Request (0x01 + i64) so the latency bar shows.
+    if let Ok(Ok(ping)) = timeout(Duration::from_secs(5), read_packet(client)).await {
+        client.write_all(&frame(&ping)).await?;
+    }
+
+    Ok(())
+}
+
+/// Open a short-lived connection to the backend and perform a status handshake,
+/// returning the raw status JSON it reports. Uses short timeouts so a stuck
+/// backend doesn't hang the client's server list.
+async fn fetch_backend_status(backend_addr: &str, handshake: &[u8]) -> io::Result<String> {
     let mut server = timeout(Duration::from_secs(3), TcpStream::connect(backend_addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status probe timed out"))??;
 
-    // Replay the (state 1) handshake, then let the client's Status Request /
-    // Ping flow through and the backend's Status Response / Pong flow back.
+    // Replay the client's (state 1) handshake, then send our own Status Request.
     server.write_all(&frame(handshake)).await?;
-    timeout(Duration::from_secs(5), io::copy_bidirectional(client, &mut server))
+    server.write_all(&frame(&[0x00])).await?;
+
+    // Read the Status Response packet: [0x00, String(VarInt len + JSON)].
+    let resp = timeout(Duration::from_secs(5), read_packet(&mut server))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status relay timed out"))??;
-    Ok(())
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status read timed out"))??;
+
+    let (packet_id, rest) = take_varint(&resp)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad status response"))?;
+    if packet_id != 0x00 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected status packet"));
+    }
+    let (json_len, rest) = take_varint(rest)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad status string"))?;
+    let json_len = json_len as usize;
+    if rest.len() < json_len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated status string"));
+    }
+    Ok(String::from_utf8_lossy(&rest[..json_len]).into_owned())
+}
+
+/// Replace the `description` field of a backend status JSON with our own MOTD
+/// text (supporting `&` color codes), preserving player count/version/favicon.
+/// Falls back to the original JSON if it can't be parsed.
+fn override_description(backend_json: &str, motd: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(backend_json) {
+        Ok(mut value) => {
+            value["description"] =
+                serde_json::json!({ "text": translate_colors(motd) });
+            value.to_string()
+        }
+        Err(_) => backend_json.to_string(),
+    }
 }
 
 async fn proxy_to_backend(
