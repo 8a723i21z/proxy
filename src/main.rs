@@ -22,13 +22,11 @@ struct State {
     active: AtomicUsize,
     /// Unix seconds of the last time a player was connected (0 = never/asleep).
     last_active: AtomicU64,
-    /// Seconds after the last player leaves before the container sleeps. The
-    /// online MOTD keeps showing (from cache) for this long.
+    /// Seconds after the last player leaves during which the online MOTD keeps
+    /// showing (from cache/config, with 0 players); after this it goes offline.
     sleep_timeout: u64,
-    /// Seconds after the last player leaves during which we still probe the
-    /// backend for its live status. Must be shorter than the container's idle
-    /// timer so we never probe a slept container.
-    probe_grace: u64,
+    /// Fallback max-players for the online MOTD when nothing has been cached yet.
+    max_players: u64,
     /// How long to keep retrying the backend connection on a join before giving up.
     connect_timeout: u64,
     /// True while a background task is booting the backend, to avoid piling up.
@@ -71,12 +69,11 @@ async fn main() -> io::Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
-    // How long after the last player leaves we keep probing the backend for its
-    // live status. Keep this well below the container's idle timer.
-    let probe_grace = std::env::var("PROBE_GRACE_SECS")
+    // Fallback max-players shown on the online MOTD before anything is cached.
+    let max_players = std::env::var("MAX_PLAYERS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(20);
     // Message shown to a player who joins while the backend is still booting.
     // Supports the same & color/format/hex codes and JSON as MOTD.
     let startup_message = std::env::var("STARTUP_MESSAGE").unwrap_or_else(|_| {
@@ -86,8 +83,7 @@ async fn main() -> io::Result<()> {
 
     println!("Starting proxy on {}", bind_addr);
     println!("Backend: {}", backend_addr);
-    println!("Sleep timeout: {}s", sleep_timeout);
-    println!("Probe grace: {}s", probe_grace);
+    println!("Online MOTD window: {}s", sleep_timeout);
     println!("Connect timeout: {}s", connect_timeout);
     println!("Quick-connect window: {}s", QUICK_CONNECT_SECS);
     match &motd_online {
@@ -100,7 +96,7 @@ async fn main() -> io::Result<()> {
         active: AtomicUsize::new(0),
         last_active: AtomicU64::new(0),
         sleep_timeout,
-        probe_grace,
+        max_players,
         connect_timeout,
         waking: AtomicBool::new(false),
         cached_status: Mutex::new(None),
@@ -181,17 +177,12 @@ async fn handle_client(
         let online = state.active.load(Ordering::Acquire);
         let since = secs_since_active(&state);
 
-        // Probe the backend for its real status only while a player is connected
-        // OR within the short probe-grace window after the last one left. Never
-        // probe beyond that, so an idle container is free to sleep.
-        let may_probe = online > 0 || since.is_some_and(|s| s < state.probe_grace);
-        // Keep showing the online MOTD (from cache) for the longer sleep window.
-        let show_online = online > 0 || since.is_some_and(|s| s < state.sleep_timeout);
-
         let cached = || state.cached_status.lock().ok().and_then(|c| c.clone());
 
-        let json = if may_probe {
-            println!("[status] probing backend for live status (online={})", online);
+        let json = if online > 0 {
+            // A player is connected: probe the backend for its real status
+            // (description/max/favicon) and cache it. Count comes from the proxy.
+            println!("[status] player online, probing backend (online={})", online);
             match fetch_backend_status(backend_addr, &handshake).await {
                 Ok(backend_json) => {
                     if let Ok(mut cache) = state.cached_status.lock() {
@@ -200,25 +191,18 @@ async fn handle_client(
                     build_online_json(&backend_json, motd_online, online)
                 }
                 Err(e) => {
-                    // Backend unreachable: fall back to cache within the window.
-                    println!("[status] probe failed ({}), using cache/offline", e);
-                    match cached() {
-                        Some(bj) if show_online => build_online_json(&bj, motd_online, online),
-                        _ => offline_status_json(motd, protocol),
-                    }
+                    println!("[status] probe failed ({}), using cache/config", e);
+                    online_or_offline_json(cached(), motd_online, online, &state, protocol, motd)
                 }
             }
-        } else if show_online {
-            // Past the probe window but still "online": serve cached, no probe.
-            match cached() {
-                Some(bj) => {
-                    println!("[status] serving cached status (no probe)");
-                    build_online_json(&bj, motd_online, online)
-                }
-                None => offline_status_json(motd, protocol),
-            }
+        } else if since.is_some_and(|s| s < state.sleep_timeout) {
+            // Idle but within the display window: show the online MOTD from cache
+            // or MOTD_ONLINE with 0 players, and NEVER touch the backend so the
+            // container can sleep on its own schedule.
+            println!("[status] idle within window, serving online MOTD (no probe)");
+            online_or_offline_json(cached(), motd_online, 0, &state, protocol, motd)
         } else {
-            println!("[status] backend asleep, serving offline MOTD");
+            println!("[status] idle past window, serving offline MOTD");
             offline_status_json(motd, protocol)
         };
 
@@ -335,6 +319,37 @@ fn offline_status_json(motd: &str, protocol: i32) -> String {
         "version": { "name": "sleeping", "protocol": protocol },
         "players": { "max": 0, "online": 0, "sample": [] },
         "description": motd_component(motd),
+    })
+    .to_string()
+}
+
+/// Serve an online-looking status without probing the backend: prefer the cached
+/// backend status, else synthesize one from MOTD_ONLINE, else fall back to the
+/// offline MOTD. `online` is the (proxy-tracked) player count to display.
+fn online_or_offline_json(
+    cached: Option<String>,
+    motd_online: Option<&str>,
+    online: usize,
+    state: &State,
+    protocol: i32,
+    offline_motd: &str,
+) -> String {
+    if let Some(backend_json) = cached {
+        build_online_json(&backend_json, motd_online, online)
+    } else if let Some(text) = motd_online {
+        synth_online_json(text, state.max_players, online, protocol)
+    } else {
+        offline_status_json(offline_motd, protocol)
+    }
+}
+
+/// Synthesize an online status JSON purely from config (no backend data), for
+/// when the online MOTD is needed but nothing has been cached yet.
+fn synth_online_json(description: &str, max: u64, online: usize, protocol: i32) -> String {
+    serde_json::json!({
+        "version": { "name": "online", "protocol": protocol },
+        "players": { "max": max, "online": online, "sample": [] },
+        "description": motd_component(description),
     })
     .to_string()
 }
