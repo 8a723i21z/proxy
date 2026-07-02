@@ -238,13 +238,12 @@ async fn fetch_backend_status(backend_addr: &str, handshake: &[u8]) -> io::Resul
 }
 
 /// Replace the `description` field of a backend status JSON with our own MOTD
-/// text (supporting `&` color codes), preserving player count/version/favicon.
-/// Falls back to the original JSON if it can't be parsed.
+/// (supporting `&` color/format codes and `&x` hex gradients), preserving player
+/// count/version/favicon. Falls back to the original JSON if it can't be parsed.
 fn override_description(backend_json: &str, motd: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(backend_json) {
         Ok(mut value) => {
-            value["description"] =
-                serde_json::json!({ "text": translate_colors(motd) });
+            value["description"] = motd_component(motd);
             value.to_string()
         }
         Err(_) => backend_json.to_string(),
@@ -283,13 +282,12 @@ async fn handle_status(client: &mut TcpStream, motd: &str, protocol: i32) -> io:
     let _req = read_packet(client).await?;
 
     // Echo the client's own protocol number so it never shows "incompatible".
-    let json = format!(
-        "{{\"version\":{{\"name\":\"sleeping\",\"protocol\":{protocol}}},\
-          \"players\":{{\"max\":0,\"online\":0,\"sample\":[]}},\
-          \"description\":{{\"text\":{motd}}}}}",
-        protocol = protocol,
-        motd = json_string(&translate_colors(motd)),
-    );
+    let status = serde_json::json!({
+        "version": { "name": "sleeping", "protocol": protocol },
+        "players": { "max": 0, "online": 0, "sample": [] },
+        "description": motd_component(motd),
+    });
+    let json = status.to_string();
 
     let mut payload = vec![0x00u8]; // Status Response packet id
     payload.extend_from_slice(&frame(json.as_bytes())); // String = VarInt len + UTF-8
@@ -423,44 +421,181 @@ fn encode_varint(mut value: u32) -> Vec<u8> {
     out
 }
 
-/// Translate Bukkit-style `&` color/format codes into the section sign (§)
-/// codes the Minecraft protocol actually uses, mirroring Spigot's
-/// translateAlternateColorCodes. `&c&l` -> `§c§l`. This also covers Bungee hex
-/// codes of the form `&x&r&r&g&g&b&b`. An `&` not followed by a valid code is
-/// left untouched, so `&&` and stray ampersands survive.
-fn translate_colors(s: &str) -> String {
-    const CODES: &str = "0123456789abcdefklmnorxABCDEFKLMNORX";
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '&' {
-            if let Some(&next) = chars.peek() {
-                if CODES.contains(next) {
-                    out.push('\u{00A7}');
-                    continue; // the code char itself is pushed next iteration
-                }
-            }
+/// Build a Minecraft text component (as JSON) from a MOTD string.
+///
+/// Accepts three input styles so you can paste whichever your gradient tool
+/// produces:
+///   1. A raw JSON chat component (starts with `{` or `[`) -> used verbatim.
+///   2. `&#RRGGBB` hex codes, e.g. `&#54DAF4C&#57D6E4l...`
+///   3. Bungee `&x&R&R&G&G&B&B` hex codes, plus named `&0`-`&f`, formats
+///      `&k`-`&o`, and reset `&r`.
+/// A color code (named or hex) resets active formatting, matching vanilla.
+fn motd_component(motd: &str) -> serde_json::Value {
+    let trimmed = motd.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(motd) {
+            return value;
         }
-        out.push(c);
     }
-    out
+    parse_legacy_motd(motd)
 }
 
-/// Minimal JSON string encoder for the MOTD text.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+/// Parse `&`/`§` color, hex, and format codes into a `{text,extra:[...]}`
+/// component with one run per style change.
+fn parse_legacy_motd(motd: &str) -> serde_json::Value {
+    let chars: Vec<char> = motd.chars().collect();
+    let mut runs: Vec<serde_json::Value> = Vec::new();
+    let mut buf = String::new();
+    let mut style = Style::default();
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if (c == '&' || c == '\u{00A7}') && i + 1 < chars.len() {
+            let next = chars[i + 1];
+
+            // &#RRGGBB
+            if next == '#'
+                && i + 8 <= chars.len()
+                && chars[i + 2..i + 8].iter().all(|c| c.is_ascii_hexdigit())
+            {
+                flush_run(&mut runs, &mut buf, &style);
+                let hex: String = chars[i + 2..i + 8].iter().collect();
+                style.set_color(format!("#{}", hex.to_lowercase()));
+                i += 8;
+                continue;
+            }
+
+            // &x&R&R&G&G&B&B (Bungee hex)
+            if next == 'x' || next == 'X' {
+                if let Some((hex, end)) = read_bungee_hex(&chars, i) {
+                    flush_run(&mut runs, &mut buf, &style);
+                    style.set_color(format!("#{}", hex.to_lowercase()));
+                    i = end;
+                    continue;
+                }
+            }
+
+            // Named color, format, or reset.
+            let code = next.to_ascii_lowercase();
+            if let Some(name) = color_name(code) {
+                flush_run(&mut runs, &mut buf, &style);
+                style.set_color(name.to_string());
+                i += 2;
+                continue;
+            }
+            if let Some(applied) = style.apply_format(code) {
+                if applied {
+                    flush_run(&mut runs, &mut buf, &style);
+                }
+                i += 2;
+                continue;
+            }
+        }
+        buf.push(c);
+        i += 1;
+    }
+    flush_run(&mut runs, &mut buf, &style);
+    serde_json::json!({ "text": "", "extra": runs })
+}
+
+/// Read six `&<hex>` pairs after a `&x`, returning (hex string, index past them).
+fn read_bungee_hex(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut hex = String::with_capacity(6);
+    let mut j = start + 2;
+    for _ in 0..6 {
+        if j + 1 < chars.len()
+            && (chars[j] == '&' || chars[j] == '\u{00A7}')
+            && chars[j + 1].is_ascii_hexdigit()
+        {
+            hex.push(chars[j + 1]);
+            j += 2;
+        } else {
+            return None;
         }
     }
-    out.push('"');
-    out
+    Some((hex, j))
+}
+
+#[derive(Default)]
+struct Style {
+    color: Option<String>,
+    bold: bool,
+    italic: bool,
+    underlined: bool,
+    strikethrough: bool,
+    obfuscated: bool,
+}
+
+impl Style {
+    /// Set a color, resetting active formatting like vanilla legacy codes do.
+    fn set_color(&mut self, color: String) {
+        *self = Style { color: Some(color), ..Style::default() };
+    }
+
+    /// Apply a format/reset code. Returns Some(true) if it changed style,
+    /// Some(false) if it was a no-op reset, None if `code` isn't a format code.
+    fn apply_format(&mut self, code: char) -> Option<bool> {
+        match code {
+            'k' => self.obfuscated = true,
+            'l' => self.bold = true,
+            'm' => self.strikethrough = true,
+            'n' => self.underlined = true,
+            'o' => self.italic = true,
+            'r' => *self = Style::default(),
+            _ => return None,
+        }
+        Some(true)
+    }
+}
+
+/// Append the buffered text as a styled run, then clear the buffer.
+fn flush_run(runs: &mut Vec<serde_json::Value>, buf: &mut String, style: &Style) {
+    if buf.is_empty() {
+        return;
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("text".into(), serde_json::Value::String(std::mem::take(buf)));
+    if let Some(color) = &style.color {
+        obj.insert("color".into(), serde_json::Value::String(color.clone()));
+    }
+    if style.bold {
+        obj.insert("bold".into(), true.into());
+    }
+    if style.italic {
+        obj.insert("italic".into(), true.into());
+    }
+    if style.underlined {
+        obj.insert("underlined".into(), true.into());
+    }
+    if style.strikethrough {
+        obj.insert("strikethrough".into(), true.into());
+    }
+    if style.obfuscated {
+        obj.insert("obfuscated".into(), true.into());
+    }
+    runs.push(serde_json::Value::Object(obj));
+}
+
+/// Map a legacy color code (`0`-`f`) to its Minecraft color name.
+fn color_name(code: char) -> Option<&'static str> {
+    Some(match code {
+        '0' => "black",
+        '1' => "dark_blue",
+        '2' => "dark_green",
+        '3' => "dark_aqua",
+        '4' => "dark_red",
+        '5' => "dark_purple",
+        '6' => "gold",
+        '7' => "gray",
+        '8' => "dark_gray",
+        '9' => "blue",
+        'a' => "green",
+        'b' => "aqua",
+        'c' => "red",
+        'd' => "light_purple",
+        'e' => "yellow",
+        'f' => "white",
+        _ => return None,
+    })
 }
