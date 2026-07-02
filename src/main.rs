@@ -22,8 +22,13 @@ struct State {
     active: AtomicUsize,
     /// Unix seconds of the last time a player was connected (0 = never/asleep).
     last_active: AtomicU64,
-    /// Seconds after the last player leaves before the container sleeps.
+    /// Seconds after the last player leaves before the container sleeps. The
+    /// online MOTD keeps showing (from cache) for this long.
     sleep_timeout: u64,
+    /// Seconds after the last player leaves during which we still probe the
+    /// backend for its live status. Must be shorter than the container's idle
+    /// timer so we never probe a slept container.
+    probe_grace: u64,
     /// How long to keep retrying the backend connection on a join before giving up.
     connect_timeout: u64,
     /// True while a background task is booting the backend, to avoid piling up.
@@ -66,6 +71,12 @@ async fn main() -> io::Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
+    // How long after the last player leaves we keep probing the backend for its
+    // live status. Keep this well below the container's idle timer.
+    let probe_grace = std::env::var("PROBE_GRACE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
     // Message shown to a player who joins while the backend is still booting.
     // Supports the same & color/format/hex codes and JSON as MOTD.
     let startup_message = std::env::var("STARTUP_MESSAGE").unwrap_or_else(|_| {
@@ -76,6 +87,7 @@ async fn main() -> io::Result<()> {
     println!("Starting proxy on {}", bind_addr);
     println!("Backend: {}", backend_addr);
     println!("Sleep timeout: {}s", sleep_timeout);
+    println!("Probe grace: {}s", probe_grace);
     println!("Connect timeout: {}s", connect_timeout);
     println!("Quick-connect window: {}s", QUICK_CONNECT_SECS);
     match &motd_online {
@@ -88,6 +100,7 @@ async fn main() -> io::Result<()> {
         active: AtomicUsize::new(0),
         last_active: AtomicU64::new(0),
         sleep_timeout,
+        probe_grace,
         connect_timeout,
         waking: AtomicBool::new(false),
         cached_status: Mutex::new(None),
@@ -162,36 +175,47 @@ async fn handle_client(
         // Status / server-list ping. Consume the client's Status Request first.
         let _req = read_packet(&mut client).await?;
 
-        // IMPORTANT: only ever connect to the backend while a player is actually
-        // connected (active > 0). Probing an idle-but-not-yet-slept container
-        // counts as traffic and resets its idle-sleep timer, keeping it awake.
-        let json = if state.active.load(Ordering::Acquire) > 0 {
-            println!("[status] player online, fetching live status from backend");
+        // The online player count is always the proxy's own live connection
+        // count (every player flows through us), so it's accurate without asking
+        // the backend.
+        let online = state.active.load(Ordering::Acquire);
+        let since = secs_since_active(&state);
+
+        // Probe the backend for its real status only while a player is connected
+        // OR within the short probe-grace window after the last one left. Never
+        // probe beyond that, so an idle container is free to sleep.
+        let may_probe = online > 0 || since.is_some_and(|s| s < state.probe_grace);
+        // Keep showing the online MOTD (from cache) for the longer sleep window.
+        let show_online = online > 0 || since.is_some_and(|s| s < state.sleep_timeout);
+
+        let cached = || state.cached_status.lock().ok().and_then(|c| c.clone());
+
+        let json = if may_probe {
+            println!("[status] probing backend for live status (online={})", online);
             match fetch_backend_status(backend_addr, &handshake).await {
                 Ok(backend_json) => {
                     if let Ok(mut cache) = state.cached_status.lock() {
                         *cache = Some(backend_json.clone());
                     }
-                    build_online_json(&backend_json, motd_online, false)
+                    build_online_json(&backend_json, motd_online, online)
                 }
                 Err(e) => {
-                    println!("[status] probe failed ({}), serving offline MOTD", e);
-                    offline_status_json(motd, protocol)
+                    // Backend unreachable: fall back to cache within the window.
+                    println!("[status] probe failed ({}), using cache/offline", e);
+                    match cached() {
+                        Some(bj) if show_online => build_online_json(&bj, motd_online, online),
+                        _ => offline_status_json(motd, protocol),
+                    }
                 }
             }
-        } else if within_grace(&state) {
-            // Grace window after the last player left: show the online MOTD from
-            // the cached status WITHOUT touching the backend, so the container is
-            // free to sleep on its own schedule.
-            match state.cached_status.lock().ok().and_then(|c| c.clone()) {
-                Some(backend_json) => {
-                    println!("[status] grace window, serving cached status (no probe)");
-                    build_online_json(&backend_json, motd_online, true)
+        } else if show_online {
+            // Past the probe window but still "online": serve cached, no probe.
+            match cached() {
+                Some(bj) => {
+                    println!("[status] serving cached status (no probe)");
+                    build_online_json(&bj, motd_online, online)
                 }
-                None => {
-                    println!("[status] grace window but no cached status, serving offline MOTD");
-                    offline_status_json(motd, protocol)
-                }
+                None => offline_status_json(motd, protocol),
             }
         } else {
             println!("[status] backend asleep, serving offline MOTD");
@@ -280,11 +304,15 @@ async fn send_login_disconnect(client: &mut TcpStream, message: &str) -> io::Res
     Ok(())
 }
 
-/// True if the last player left within the container's sleep-timeout window
-/// (so the backend is probably still up, but we must not probe it).
-fn within_grace(state: &State) -> bool {
+/// Seconds since a player was last connected, or None if none ever were
+/// (or the backend was marked asleep).
+fn secs_since_active(state: &State) -> Option<u64> {
     let last = state.last_active.load(Ordering::Acquire);
-    last != 0 && now_secs().saturating_sub(last) < state.sleep_timeout
+    if last == 0 {
+        None
+    } else {
+        Some(now_secs().saturating_sub(last))
+    }
 }
 
 /// Send a Status Response (0x00 + JSON) to the client, then echo its Ping
@@ -312,19 +340,17 @@ fn offline_status_json(motd: &str, protocol: i32) -> String {
 }
 
 /// Build an online status JSON from the backend's status. Optionally swaps the
-/// description for MOTD_ONLINE. When `force_zero_online` is set (grace window,
-/// nobody connected), the player count is forced to 0. Falls back to the raw
-/// backend JSON if it can't be parsed.
-fn build_online_json(backend_json: &str, motd_online: Option<&str>, force_zero_online: bool) -> String {
+/// description for MOTD_ONLINE, and sets the online player count to `online`
+/// (the proxy's own live count). Falls back to the raw backend JSON if it can't
+/// be parsed.
+fn build_online_json(backend_json: &str, motd_online: Option<&str>, online: usize) -> String {
     match serde_json::from_str::<serde_json::Value>(backend_json) {
         Ok(mut value) => {
             if let Some(text) = motd_online {
                 value["description"] = motd_component(text);
             }
-            if force_zero_online {
-                if let Some(players) = value.get_mut("players") {
-                    players["online"] = serde_json::Value::from(0);
-                }
+            if let Some(players) = value.get_mut("players") {
+                players["online"] = serde_json::Value::from(online);
             }
             value.to_string()
         }
