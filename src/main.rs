@@ -19,14 +19,22 @@ async fn main() -> io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "25565".to_string());
     let motd = std::env::var("MOTD")
         .unwrap_or_else(|_| "Server is asleep \u{2014} join to wake it up!".to_string());
+    // Optional: a static MOTD shown while the backend is online. If unset, the
+    // proxy relays the backend's real MOTD (live player count/version) instead.
+    let motd_online = std::env::var("MOTD_ONLINE").ok();
     let bind_addr = format!("0.0.0.0:{}", port);
 
     println!("Starting proxy on {}", bind_addr);
     println!("Backend: {}", backend_addr);
+    match &motd_online {
+        Some(_) => println!("Online MOTD: static (MOTD_ONLINE set)"),
+        None => println!("Online MOTD: live passthrough from backend"),
+    }
 
     let listener = TcpListener::bind(&bind_addr).await?;
     let active = Arc::new(AtomicUsize::new(0));
     let motd = Arc::new(motd);
+    let motd_online = Arc::new(motd_online);
 
     {
         let active = active.clone();
@@ -56,9 +64,11 @@ async fn main() -> io::Result<()> {
         let active = active.clone();
         let backend_addr = backend_addr.clone();
         let motd = motd.clone();
+        let motd_online = motd_online.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(client, &backend_addr, &motd, active).await {
+            let res = handle_client(client, &backend_addr, &motd, motd_online.as_deref(), active).await;
+            if let Err(e) = res {
                 eprintln!("[conn] error from {}: {}", addr, e);
             }
         });
@@ -69,6 +79,7 @@ async fn handle_client(
     mut client: TcpStream,
     backend_addr: &str,
     motd: &str,
+    motd_online: Option<&str>,
     active: Arc<AtomicUsize>,
 ) -> io::Result<()> {
     // First packet on every connection is the Handshake. Read it whole so we
@@ -78,8 +89,29 @@ async fn handle_client(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed handshake"))?;
 
     if next_state == 1 {
-        // Status / server-list ping. Answer it ourselves; DO NOT wake the backend.
-        println!("[status] server-list ping (protocol {}), backend stays asleep", protocol);
+        // Status / server-list ping. Never wakes the backend.
+        // If a player is connected through us the backend is provably awake, so
+        // we can reflect its real state; otherwise it's asleep -> local MOTD.
+        if active.load(Ordering::Acquire) > 0 {
+            match motd_online {
+                // Static online MOTD configured: answer locally, no probe.
+                Some(text) => {
+                    println!("[status] backend online, serving static MOTD_ONLINE");
+                    handle_status(&mut client, text, protocol).await?;
+                    return Ok(());
+                }
+                // Default: relay the backend's real status (live MOTD/count).
+                None => {
+                    println!("[status] backend online, relaying real MOTD from backend");
+                    if relay_status(&mut client, backend_addr, &handshake).await.is_ok() {
+                        return Ok(());
+                    }
+                    println!("[status] relay failed, falling back to sleeping MOTD");
+                }
+            }
+        } else {
+            println!("[status] server-list ping (protocol {}), backend asleep", protocol);
+        }
         handle_status(&mut client, motd, protocol).await?;
         return Ok(());
     }
@@ -94,6 +126,29 @@ async fn handle_client(
     println!("[join] connection ended, active: {}", current);
 
     result
+}
+
+/// Relay a status ping to the backend and pipe its real response back to the
+/// client. Only called when the backend is known to be online (active > 0), so
+/// the connect below does not risk waking a sleeping instance. Uses a short
+/// timeout: if the backend doesn't answer quickly, the caller falls back to the
+/// local sleeping MOTD rather than hanging the client's server list.
+async fn relay_status(
+    client: &mut TcpStream,
+    backend_addr: &str,
+    handshake: &[u8],
+) -> io::Result<()> {
+    let mut server = timeout(Duration::from_secs(3), TcpStream::connect(backend_addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status probe timed out"))??;
+
+    // Replay the (state 1) handshake, then let the client's Status Request /
+    // Ping flow through and the backend's Status Response / Pong flow back.
+    server.write_all(&frame(handshake)).await?;
+    timeout(Duration::from_secs(5), io::copy_bidirectional(client, &mut server))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status relay timed out"))??;
+    Ok(())
 }
 
 async fn proxy_to_backend(
