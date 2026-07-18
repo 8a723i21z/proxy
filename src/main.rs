@@ -240,16 +240,30 @@ async fn handle_join(
             // Backend already up: replay the handshake and proxy through.
             println!("[join] backend reachable, proxying");
             server.write_all(&frame(handshake)).await?;
-            match io::copy_bidirectional(&mut client, &mut server).await {
-                Ok((c2s, s2c)) => {
-                    println!("[conn] closed (client->server {} bytes, server->client {} bytes)", c2s, s2c);
-                    Ok(())
-                }
-                Err(e) => {
-                    println!("[conn] proxy error: {}", e);
-                    Err(e)
-                }
+
+            // Pipe both directions, but tear DOWN BOTH the instant either side
+            // ends. copy_bidirectional keeps the other half-open until both sides
+            // close, which can leave the backend session (and our `active` count)
+            // hanging after the client drops — widening the window where a
+            // reconnect collides with the still-registered session. select! ends
+            // as soon as one direction finishes and drops both connections.
+            let (mut cr, mut cw) = client.split();
+            let (mut sr, mut sw) = server.split();
+            let client_to_server = async {
+                let n = io::copy(&mut cr, &mut sw).await;
+                let _ = sw.shutdown().await;
+                n
+            };
+            let server_to_client = async {
+                let n = io::copy(&mut sr, &mut cw).await;
+                let _ = cw.shutdown().await;
+                n
+            };
+            tokio::select! {
+                r = client_to_server => println!("[conn] client closed ({:?} bytes), tearing down", r.ok()),
+                r = server_to_client => println!("[conn] backend closed ({:?} bytes), tearing down", r.ok()),
             }
+            Ok(())
         }
         _ => {
             // Backend asleep/booting: kick off the boot and ask the player to rejoin.
