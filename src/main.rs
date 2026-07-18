@@ -1,9 +1,11 @@
 use tokio::{
     net::{TcpListener, TcpStream},
     io::{self, AsyncReadExt, AsyncWriteExt},
+    sync::Notify,
     time::{sleep, timeout},
 };
 use std::{
+    collections::HashMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -15,6 +17,11 @@ use std::{
 /// asks the player to rejoin. Only bounds the asleep case; an already-up backend
 /// connects instantly.
 const QUICK_CONNECT_SECS: u64 = 5;
+
+/// After closing a player's previous session, how long to wait before letting
+/// their new login reach the backend, so the server registers the disconnect
+/// first and never fires "logged in from another location".
+const SESSION_HANDOFF_MS: u64 = 750;
 
 /// Shared runtime state used to decide whether the backend is currently awake.
 struct State {
@@ -35,6 +42,9 @@ struct State {
     /// Served (without probing) during the post-disconnect grace window so the
     /// online MOTD keeps showing without resetting the container's idle timer.
     cached_status: Mutex<Option<String>>,
+    /// Live sessions keyed by username, each with a handle to cancel it. Lets a
+    /// reconnect close the player's previous session before the new login lands.
+    sessions: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 fn now_secs() -> u64 {
@@ -100,6 +110,7 @@ async fn main() -> io::Result<()> {
         connect_timeout,
         waking: AtomicBool::new(false),
         cached_status: Mutex::new(None),
+        sessions: Mutex::new(HashMap::new()),
     });
     let motd = Arc::new(motd);
     let motd_online = Arc::new(motd_online);
@@ -210,12 +221,41 @@ async fn handle_client(
         return Ok(());
     }
 
-    // next_state == 2 (login) or 3 (transfer): a real join.
+    // next_state == 2 (login) or 3 (transfer): a real join. The client's next
+    // packet is Login Start; read it so we can learn the username (for
+    // single-session enforcement) and replay it to the backend.
+    let login_start = match timeout(Duration::from_secs(10), read_packet(&mut client)).await {
+        Ok(Ok(packet)) => packet,
+        Ok(Err(e)) => {
+            eprintln!("[join] failed to read login start: {}", e);
+            return Ok(());
+        }
+        Err(_) => {
+            eprintln!("[join] timed out reading login start");
+            return Ok(());
+        }
+    };
+    let username = parse_login_username(&login_start);
+
     let current = state.active.fetch_add(1, Ordering::AcqRel) + 1;
     state.last_active.store(now_secs(), Ordering::Release);
-    println!("[join] player joining (state {}), active connections: {}", next_state, current);
+    println!(
+        "[join] {} joining (state {}), active connections: {}",
+        username.as_deref().unwrap_or("<unknown>"),
+        next_state,
+        current
+    );
 
-    let result = handle_join(client, backend_addr, &handshake, &state, startup_message).await;
+    let result = handle_join(
+        client,
+        backend_addr,
+        &handshake,
+        &login_start,
+        username.as_deref(),
+        &state,
+        startup_message,
+    )
+    .await;
 
     let current = state.active.fetch_sub(1, Ordering::AcqRel) - 1;
     // Start the idle countdown from the moment this player left.
@@ -232,6 +272,8 @@ async fn handle_join(
     mut client: TcpStream,
     backend_addr: &str,
     handshake: &[u8],
+    login_start: &[u8],
+    username: Option<&str>,
     state: &Arc<State>,
     startup_message: &str,
 ) -> io::Result<()> {
@@ -239,29 +281,58 @@ async fn handle_join(
         Ok(Ok(mut server)) => {
             // Backend already up: replay the handshake and proxy through.
             println!("[join] backend reachable, proxying");
-            server.write_all(&frame(handshake)).await?;
 
-            // Pipe both directions, but tear DOWN BOTH the instant either side
-            // ends. copy_bidirectional keeps the other half-open until both sides
-            // close, which can leave the backend session (and our `active` count)
-            // hanging after the client drops — widening the window where a
-            // reconnect collides with the still-registered session. select! ends
-            // as soon as one direction finishes and drops both connections.
+            // Single-session enforcement: if this account already has a live
+            // session, cancel it and give the backend a moment to register the
+            // disconnect BEFORE this login lands — so the server never fires
+            // "logged in from another location" when a player reconnects.
+            let cancel = Arc::new(Notify::new());
+            if let Some(name) = username {
+                let previous = state
+                    .sessions
+                    .lock()
+                    .ok()
+                    .and_then(|mut sessions| sessions.insert(name.to_string(), cancel.clone()));
+                if let Some(prev) = previous {
+                    println!("[join] {} reconnected; closing previous session first", name);
+                    prev.notify_one();
+                    sleep(Duration::from_millis(SESSION_HANDOFF_MS)).await;
+                }
+            }
+
+            // The backend never saw the handshake or login start we consumed.
+            server.write_all(&frame(handshake)).await?;
+            server.write_all(&frame(login_start)).await?;
+
+            // Pipe both directions, tearing DOWN BOTH the instant either side
+            // ends OR this session is superseded by a newer login for the same
+            // account. (copy_bidirectional would keep the other half-open until
+            // both sides close, leaving the backend session and our `active`
+            // count hanging after a client drops.)
             let (mut cr, mut cw) = client.split();
             let (mut sr, mut sw) = server.split();
             let client_to_server = async {
-                let n = io::copy(&mut cr, &mut sw).await;
+                let _ = io::copy(&mut cr, &mut sw).await;
                 let _ = sw.shutdown().await;
-                n
             };
             let server_to_client = async {
-                let n = io::copy(&mut sr, &mut cw).await;
+                let _ = io::copy(&mut sr, &mut cw).await;
                 let _ = cw.shutdown().await;
-                n
             };
             tokio::select! {
-                r = client_to_server => println!("[conn] client closed ({:?} bytes), tearing down", r.ok()),
-                r = server_to_client => println!("[conn] backend closed ({:?} bytes), tearing down", r.ok()),
+                _ = client_to_server => println!("[conn] client closed, tearing down"),
+                _ = server_to_client => println!("[conn] backend closed, tearing down"),
+                _ = cancel.notified() => println!("[conn] superseded by a newer session, tearing down"),
+            }
+
+            // Deregister, but only if we're still the current session for this
+            // name (a newer session may have replaced our map entry already).
+            if let Some(name) = username {
+                if let Ok(mut sessions) = state.sessions.lock() {
+                    if sessions.get(name).is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
+                        sessions.remove(name);
+                    }
+                }
             }
             Ok(())
         }
@@ -272,6 +343,21 @@ async fn handle_join(
             send_login_disconnect(&mut client, startup_message).await
         }
     }
+}
+
+/// Parse the username out of a Login Start packet (its first field is always a
+/// String, across protocol versions). Returns None if it doesn't look like one.
+fn parse_login_username(login_start: &[u8]) -> Option<String> {
+    let (packet_id, rest) = take_varint(login_start)?;
+    if packet_id != 0x00 {
+        return None;
+    }
+    let (len, rest) = take_varint(rest)?;
+    let len = len as usize;
+    if len == 0 || len > 48 || rest.len() < len {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&rest[..len]).into_owned())
 }
 
 /// Spawn a background task that boots the backend, unless one is already running.
