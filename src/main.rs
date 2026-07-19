@@ -1,7 +1,8 @@
 use tokio::{
     net::{TcpListener, TcpStream},
     io::{self, AsyncReadExt, AsyncWriteExt},
-    sync::Notify,
+    signal::unix::{signal, SignalKind},
+    sync::{Notify, Semaphore},
     time::{sleep, timeout},
 };
 use std::{
@@ -10,7 +11,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// How long a join waits for the backend to be reachable before it gives up and
@@ -22,6 +23,20 @@ const QUICK_CONNECT_SECS: u64 = 5;
 /// their new login reach the backend, so the server registers the disconnect
 /// first and never fires "logged in from another location".
 const SESSION_HANDOFF_MS: u64 = 750;
+
+/// Maximum size of any pre-play packet we read and buffer ourselves (handshake,
+/// login start, status request). The largest legitimate one (login start with
+/// signature data) is ~2KB; this cap stops attackers making us allocate big
+/// buffers per connection. Play-phase traffic is raw-copied and unaffected.
+const MAX_PREPLAY_PACKET: i32 = 64 * 1024;
+
+/// Maximum size of a backend status response we read (may embed a base64
+/// favicon, so it can legitimately reach tens of KB).
+const MAX_STATUS_PACKET: i32 = 256 * 1024;
+
+/// On SIGTERM (Railway redeploy/stop), how long to keep serving existing
+/// sessions before exiting so players aren't cut mid-write.
+const DRAIN_SECS: u64 = 25;
 
 /// Shared runtime state used to decide whether the backend is currently awake.
 struct State {
@@ -97,6 +112,12 @@ async fn main() -> io::Result<()> {
     });
     // Optional favicon for locally-built statuses (data:image/png;base64,...).
     let favicon = std::env::var("FAVICON").ok().filter(|s| !s.is_empty());
+    // Cap on simultaneously open client connections (players + pings + scanners).
+    // Protects fds/memory so a connection flood can't take the proxy down.
+    let max_connections = std::env::var("MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(256);
     let bind_addr = format!("0.0.0.0:{}", port);
 
     println!("Starting proxy on {}", bind_addr);
@@ -160,9 +181,39 @@ async fn main() -> io::Result<()> {
         });
     }
 
+    let conn_limit = Arc::new(Semaphore::new(max_connections));
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    // Accept loop. Two availability rules:
+    //  - accept() errors (EMFILE, ECONNABORTED, ...) are transient conditions,
+    //    never a reason to exit: log, back off briefly, keep serving.
+    //  - SIGTERM (redeploy/stop) stops accepting but drains active sessions
+    //    for up to DRAIN_SECS so players aren't cut off mid-write.
     loop {
-        let (client, addr) = listener.accept().await?;
+        let accepted = tokio::select! {
+            _ = sigterm.recv() => break,
+            accepted = listener.accept() => accepted,
+        };
+
+        let (client, addr) = match accepted {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[conn] accept error: {} (continuing)", e);
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+            // At capacity: shed the newcomer instead of degrading everyone.
+            eprintln!("[conn] connection limit ({}) reached, dropping {}", max_connections, addr);
+            continue;
+        };
+
         println!("[conn] new client: {}", addr);
+        // Match vanilla client/server behavior; without this, Nagle adds up to
+        // ~40ms of buffering per hop on this latency-sensitive path.
+        client.set_nodelay(true).ok();
 
         let state = state.clone();
         let backend_addr = backend_addr.clone();
@@ -171,6 +222,7 @@ async fn main() -> io::Result<()> {
         let startup_message = startup_message.clone();
 
         tokio::spawn(async move {
+            let _permit = permit; // released when the connection task ends
             let res = handle_client(
                 client,
                 &backend_addr,
@@ -185,6 +237,21 @@ async fn main() -> io::Result<()> {
             }
         });
     }
+
+    // SIGTERM received: drain. New connections are no longer accepted (the
+    // replacement deployment owns those); existing sessions ride out the grace
+    // period. The keepalive task keeps running so the backend stays awake for
+    // the players still connected.
+    println!("[shutdown] SIGTERM received, draining active sessions (max {}s)", DRAIN_SECS);
+    let deadline = Instant::now() + Duration::from_secs(DRAIN_SECS);
+    while state.active.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        sleep(Duration::from_millis(500)).await;
+    }
+    println!(
+        "[shutdown] exiting (active sessions remaining: {})",
+        state.active.load(Ordering::Acquire)
+    );
+    Ok(())
 }
 
 async fn handle_client(
@@ -199,20 +266,52 @@ async fn handle_client(
     // can both inspect `next_state` and replay it verbatim to the backend.
     // Bounded by a timeout so port scanners / health checks that connect and
     // send nothing don't park this task (and two fds) forever.
-    let handshake = match timeout(Duration::from_secs(10), read_packet(&mut client)).await {
+    let first = match timeout(Duration::from_secs(10), client.read_u8()).await {
+        Ok(Ok(byte)) => byte,
+        Ok(Err(_)) | Err(_) => return Ok(()), // silent/vanished connection; drop quietly
+    };
+
+    // Legacy server-list ping (pre-1.7 clients and some scanners, first byte
+    // 0xFE). It isn't length-prefixed, so answer it in the legacy format and
+    // close instead of misparsing it as a VarInt.
+    if first == 0xFE {
+        let online = state.active.load(Ordering::Acquire);
+        let max = state.max_players;
+        let _ = send_legacy_status(&mut client, motd, online, max).await;
+        return Ok(());
+    }
+
+    let handshake = match timeout(
+        Duration::from_secs(10),
+        read_packet_after(first, &mut client, MAX_PREPLAY_PACKET),
+    )
+    .await
+    {
         Ok(packet) => packet?,
-        Err(_) => return Ok(()), // silent connection; drop it quietly
+        Err(_) => return Ok(()),
     };
     let (protocol, next_state) = parse_handshake(&handshake)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed handshake"))?;
     state.last_protocol.store(protocol as i64, Ordering::Release);
 
     if next_state == 1 {
-        // Status / server-list ping. Consume the client's Status Request first
-        // (same timeout rationale as the handshake above).
-        match timeout(Duration::from_secs(10), read_packet(&mut client)).await {
-            Ok(req) => drop(req?),
+        // Status / server-list ping. Consume the client's next packet (same
+        // timeout rationale as the handshake above).
+        let request = match timeout(
+            Duration::from_secs(10),
+            read_packet_max(&mut client, MAX_PREPLAY_PACKET),
+        )
+        .await
+        {
+            Ok(req) => req?,
             Err(_) => return Ok(()),
+        };
+
+        // Some clients skip the Status Request and send the Ping Request
+        // (0x01 + i64) directly to measure latency; echo it straight back.
+        if request.first() == Some(&0x01) {
+            client.write_all(&frame(&request)).await?;
+            return Ok(());
         }
 
         // The online player count is always the proxy's own live connection
@@ -264,7 +363,12 @@ async fn handle_client(
     // next_state == 2 (login) or 3 (transfer): a real join. The client's next
     // packet is Login Start; read it so we can learn the username (for
     // single-session enforcement) and replay it to the backend.
-    let login_start = match timeout(Duration::from_secs(10), read_packet(&mut client)).await {
+    let login_start = match timeout(
+        Duration::from_secs(10),
+        read_packet_max(&mut client, MAX_PREPLAY_PACKET),
+    )
+    .await
+    {
         Ok(Ok(packet)) => packet,
         Ok(Err(e)) => {
             eprintln!("[join] failed to read login start: {}", e);
@@ -321,6 +425,7 @@ async fn handle_join(
         Ok(Ok(mut server)) => {
             // Backend already up: replay the handshake and proxy through.
             println!("[join] backend reachable, proxying");
+            server.set_nodelay(true).ok();
 
             // Seed the status cache in the background if it's empty, so the
             // online MOTD shows the backend's real max/favicon right away
@@ -530,10 +635,64 @@ async fn send_status(client: &mut TcpStream, json: &str) -> io::Result<()> {
     payload.extend_from_slice(&frame(json.as_bytes())); // String = VarInt len + UTF-8
     client.write_all(&frame(&payload)).await?;
 
-    if let Ok(Ok(ping)) = timeout(Duration::from_secs(5), read_packet(client)).await {
+    if let Ok(Ok(ping)) = timeout(
+        Duration::from_secs(5),
+        read_packet_max(client, MAX_PREPLAY_PACKET),
+    )
+    .await
+    {
         client.write_all(&frame(&ping)).await?;
     }
     Ok(())
+}
+
+/// Answer a legacy (pre-1.7, 0xFE) server-list ping: a 0xFF packet holding a
+/// UTF-16BE string of null-separated fields. Protocol 127 marks us as a modern
+/// server so legacy clients see the MOTD but "outdated server" for joining.
+async fn send_legacy_status(
+    client: &mut TcpStream,
+    motd: &str,
+    online: usize,
+    max: u64,
+) -> io::Result<()> {
+    let text = plain_motd_text(motd);
+    let payload = format!("\u{00A7}1\0127\0\0{}\0{}\0{}", text, online, max);
+    let utf16: Vec<u16> = payload.encode_utf16().collect();
+    let mut out = vec![0xFFu8];
+    out.extend_from_slice(&(utf16.len() as u16).to_be_bytes());
+    for unit in utf16 {
+        out.extend_from_slice(&unit.to_be_bytes());
+    }
+    client.write_all(&out).await
+}
+
+/// Flatten a MOTD (any supported format) to plain text for the legacy ping.
+fn plain_motd_text(motd: &str) -> String {
+    fn collect(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::String(s) => out.push_str(s),
+            serde_json::Value::Object(obj) => {
+                if let Some(serde_json::Value::String(s)) = obj.get("text") {
+                    out.push_str(s);
+                }
+                if let Some(serde_json::Value::Array(extra)) = obj.get("extra") {
+                    for part in extra {
+                        collect(part, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(parts) => {
+                for part in parts {
+                    collect(part, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    collect(&motd_component(motd), &mut out);
+    // Null bytes are field separators in the legacy format; newlines don't render.
+    out.replace(['\0', '\n'], " ")
 }
 
 /// The local "sleeping" status JSON, echoing the client's protocol so it never
@@ -632,13 +791,14 @@ async fn fetch_backend_status(backend_addr: &str, handshake: &[u8]) -> io::Resul
     let mut server = timeout(Duration::from_secs(3), TcpStream::connect(backend_addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status probe timed out"))??;
+    server.set_nodelay(true).ok();
 
     // Replay the client's (state 1) handshake, then send our own Status Request.
     server.write_all(&frame(handshake)).await?;
     server.write_all(&frame(&[0x00])).await?;
 
     // Read the Status Response packet: [0x00, String(VarInt len + JSON)].
-    let resp = timeout(Duration::from_secs(5), read_packet(&mut server))
+    let resp = timeout(Duration::from_secs(5), read_packet_max(&mut server, MAX_STATUS_PACKET))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status read timed out"))??;
 
@@ -689,9 +849,30 @@ async fn connect_with_retry(addr: &str, deadline_secs: u64) -> io::Result<TcpStr
 // ---------- Minecraft protocol helpers ----------
 
 /// Read one length-prefixed packet, returning its body (packet id + data).
-async fn read_packet<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
+/// `max` bounds both the declared length and the allocation, so a hostile
+/// peer can't make us allocate large buffers on demand.
+async fn read_packet_max<R: AsyncReadExt + Unpin>(r: &mut R, max: i32) -> io::Result<Vec<u8>> {
     let len = read_varint(r).await?;
-    if len < 0 || len > 2 * 1024 * 1024 {
+    read_packet_body(r, len, max).await
+}
+
+/// Like `read_packet_max`, but the first byte of the length VarInt was already
+/// consumed by the caller (used for legacy-ping detection on the first byte).
+async fn read_packet_after<R: AsyncReadExt + Unpin>(
+    first: u8,
+    r: &mut R,
+    max: i32,
+) -> io::Result<Vec<u8>> {
+    let len = read_varint_cont(first, r).await?;
+    read_packet_body(r, len, max).await
+}
+
+async fn read_packet_body<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    len: i32,
+    max: i32,
+) -> io::Result<Vec<u8>> {
+    if len < 0 || len > max {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad packet length"));
     }
     let mut buf = vec![0u8; len as usize];
@@ -701,18 +882,22 @@ async fn read_packet<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> 
 
 /// Read a VarInt from an async stream.
 async fn read_varint<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<i32> {
-    let mut num: u32 = 0;
+    let byte = r.read_u8().await?;
+    read_varint_cont(byte, r).await
+}
+
+/// Continue reading a VarInt whose first byte was already consumed.
+async fn read_varint_cont<R: AsyncReadExt + Unpin>(first: u8, r: &mut R) -> io::Result<i32> {
+    let mut num: u32 = (first & 0x7F) as u32;
+    let mut byte = first;
     let mut shift = 0;
-    loop {
-        let byte = r.read_u8().await?;
-        num |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
+    while byte & 0x80 != 0 {
         shift += 7;
         if shift >= 32 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "varint too big"));
         }
+        byte = r.read_u8().await?;
+        num |= ((byte & 0x7F) as u32) << shift;
     }
     Ok(num as i32)
 }
@@ -744,6 +929,11 @@ fn parse_handshake(body: &[u8]) -> Option<(i32, i32)> {
     }
     let (protocol, rest) = take_varint(rest)?;
     let (addr_len, rest) = take_varint(rest)?;
+    // Hostnames are capped at 255 by the protocol; rejecting out-of-range
+    // values here also rules out negative-length arithmetic entirely.
+    if !(0..=255).contains(&addr_len) {
+        return None;
+    }
     let addr_len = addr_len as usize;
     if rest.len() < addr_len + 2 {
         return None;
