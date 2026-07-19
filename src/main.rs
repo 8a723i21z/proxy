@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +45,9 @@ struct State {
     /// Live sessions keyed by username, each with a handle to cancel it. Lets a
     /// reconnect close the player's previous session before the new login lands.
     sessions: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Protocol version from the most recent client handshake, echoed in the
+    /// keepalive's status pings so they look like a real client to the backend.
+    last_protocol: AtomicI64,
 }
 
 fn now_secs() -> u64 {
@@ -111,6 +114,7 @@ async fn main() -> io::Result<()> {
         waking: AtomicBool::new(false),
         cached_status: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
+        last_protocol: AtomicI64::new(0),
     });
     let motd = Arc::new(motd);
     let motd_online = Arc::new(motd_online);
@@ -120,15 +124,28 @@ async fn main() -> io::Result<()> {
         let state = state.clone();
         let backend_addr = backend_addr.clone();
 
+        // While players are connected, ping the backend with a REAL status
+        // handshake every minute. A bare TCP connect is not enough: the
+        // container host only counts Minecraft handshakes as activity, so a
+        // quietly playing player (whose last handshake was their join) would
+        // hit the idle timer and the container would stop mid-session,
+        // resetting every connection.
         tokio::spawn(async move {
             loop {
                 let count = state.active.load(Ordering::Acquire);
                 if count > 0 {
-                    println!("[keepalive] active={}, pinging backend...", count);
-
-                    match TcpStream::connect(&backend_addr).await {
-                        Ok(_) => println!("[keepalive] ping success"),
-                        Err(e) => println!("[keepalive] ping failed: {}", e),
+                    let protocol = state.last_protocol.load(Ordering::Acquire) as i32;
+                    let handshake = build_status_handshake(&backend_addr, protocol);
+                    match fetch_backend_status(&backend_addr, &handshake).await {
+                        Ok(json) => {
+                            println!("[keepalive] active={}, status ping ok", count);
+                            if let Ok(mut cache) = state.cached_status.lock() {
+                                *cache = Some(json);
+                            }
+                        }
+                        Err(e) => {
+                            println!("[keepalive] active={}, status ping failed: {}", count, e)
+                        }
                     }
                 }
 
@@ -174,13 +191,23 @@ async fn handle_client(
 ) -> io::Result<()> {
     // First packet on every connection is the Handshake. Read it whole so we
     // can both inspect `next_state` and replay it verbatim to the backend.
-    let handshake = read_packet(&mut client).await?;
+    // Bounded by a timeout so port scanners / health checks that connect and
+    // send nothing don't park this task (and two fds) forever.
+    let handshake = match timeout(Duration::from_secs(10), read_packet(&mut client)).await {
+        Ok(packet) => packet?,
+        Err(_) => return Ok(()), // silent connection; drop it quietly
+    };
     let (protocol, next_state) = parse_handshake(&handshake)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed handshake"))?;
+    state.last_protocol.store(protocol as i64, Ordering::Release);
 
     if next_state == 1 {
-        // Status / server-list ping. Consume the client's Status Request first.
-        let _req = read_packet(&mut client).await?;
+        // Status / server-list ping. Consume the client's Status Request first
+        // (same timeout rationale as the handshake above).
+        match timeout(Duration::from_secs(10), read_packet(&mut client)).await {
+            Ok(req) => drop(req?),
+            Err(_) => return Ok(()),
+        }
 
         // The online player count is always the proxy's own live connection
         // count (every player flows through us), so it's accurate without asking
@@ -304,26 +331,93 @@ async fn handle_join(
             server.write_all(&frame(handshake)).await?;
             server.write_all(&frame(login_start)).await?;
 
-            // Pipe both directions, tearing DOWN BOTH the instant either side
-            // ends OR this session is superseded by a newer login for the same
-            // account. (copy_bidirectional would keep the other half-open until
-            // both sides close, leaving the backend session and our `active`
-            // count hanging after a client drops.)
+            // Pipe both directions, tearing down BOTH when either side ends OR
+            // this session is superseded by a newer login for the same account.
+            // (copy_bidirectional would keep the other half-open until both
+            // sides close, leaving the backend session and our `active` count
+            // hanging after a client drops.)
+            let name = username.unwrap_or("<unknown>");
+            let started = std::time::Instant::now();
             let (mut cr, mut cw) = client.split();
             let (mut sr, mut sw) = server.split();
             let client_to_server = async {
-                let _ = io::copy(&mut cr, &mut sw).await;
+                let r = io::copy(&mut cr, &mut sw).await;
                 let _ = sw.shutdown().await;
+                r
             };
             let server_to_client = async {
-                let _ = io::copy(&mut sr, &mut cw).await;
+                let r = io::copy(&mut sr, &mut cw).await;
                 let _ = cw.shutdown().await;
+                r
             };
-            tokio::select! {
-                _ = client_to_server => println!("[conn] client closed, tearing down"),
-                _ = server_to_client => println!("[conn] backend closed, tearing down"),
-                _ = cancel.notified() => println!("[conn] superseded by a newer session, tearing down"),
+            enum SessionEnd {
+                Client(io::Result<u64>),
+                Backend(io::Result<u64>),
+                Superseded,
             }
+            let end = tokio::select! {
+                r = client_to_server => SessionEnd::Client(r),
+                r = server_to_client => SessionEnd::Backend(r),
+                _ = cancel.notified() => SessionEnd::Superseded,
+            };
+
+            // Log exactly which leg ended the session and how, so a disconnect
+            // can be attributed to the client<->proxy path or the
+            // proxy<->backend path from this one line.
+            let secs = started.elapsed().as_secs();
+            match &end {
+                SessionEnd::Client(Ok(n)) => println!(
+                    "[conn] {}: client closed cleanly after {}s ({} bytes c->s); closing backend",
+                    name, secs, n
+                ),
+                SessionEnd::Client(Err(e)) => println!(
+                    "[conn] {}: CLIENT-LEG error after {}s: {} (drop came from client<->proxy path)",
+                    name, secs, e
+                ),
+                SessionEnd::Backend(Ok(n)) => println!(
+                    "[conn] {}: backend closed cleanly after {}s ({} bytes s->c); closing client",
+                    name, secs, n
+                ),
+                SessionEnd::Backend(Err(e)) => println!(
+                    "[conn] {}: BACKEND-LEG error after {}s: {} (drop came from proxy<->backend path)",
+                    name, secs, e
+                ),
+                SessionEnd::Superseded => println!(
+                    "[conn] {}: superseded by a newer session after {}s; closing both",
+                    name, secs
+                ),
+            }
+
+            // Graceful teardown. Half-close our write side toward both peers
+            // (FIN), then briefly drain leftover inbound bytes. Dropping a
+            // socket with unread data in its buffer makes the kernel send RST,
+            // and an RST discards data still in flight to the peer — e.g. the
+            // server's final disconnect screen — showing up client-side as
+            // "Connection reset by peer" instead of a clean disconnect.
+            let _ = client.shutdown().await;
+            let _ = server.shutdown().await;
+            let _ = timeout(Duration::from_millis(500), async {
+                let mut cbuf = [0u8; 8192];
+                let mut sbuf = [0u8; 8192];
+                let drain_client = async {
+                    loop {
+                        match client.read(&mut cbuf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                };
+                let drain_server = async {
+                    loop {
+                        match server.read(&mut sbuf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                };
+                tokio::join!(drain_client, drain_server);
+            })
+            .await;
 
             // Deregister, but only if we're still the current session for this
             // name (a newer session may have replaced our map entry already).
@@ -471,6 +565,22 @@ fn build_online_json(backend_json: &str, motd_online: Option<&str>, online: usiz
         }
         Err(_) => backend_json.to_string(),
     }
+}
+
+/// Build a state-1 (status) handshake body addressed to `addr` ("host:port"),
+/// exactly as a vanilla client pinging the backend directly would send it.
+fn build_status_handshake(addr: &str, protocol: i32) -> Vec<u8> {
+    let (host, port) = match addr.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().unwrap_or(25565)),
+        None => (addr, 25565),
+    };
+    let mut body = vec![0x00u8]; // Handshake packet id
+    body.extend_from_slice(&encode_varint(protocol as u32));
+    body.extend_from_slice(&encode_varint(host.len() as u32));
+    body.extend_from_slice(host.as_bytes());
+    body.extend_from_slice(&port.to_be_bytes());
+    body.push(0x01); // next_state = 1 (status)
+    body
 }
 
 /// Open a short-lived connection to the backend and perform a status handshake,
