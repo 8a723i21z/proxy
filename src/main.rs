@@ -48,6 +48,9 @@ struct State {
     /// Protocol version from the most recent client handshake, echoed in the
     /// keepalive's status pings so they look like a real client to the backend.
     last_protocol: AtomicI64,
+    /// Optional favicon (a "data:image/png;base64,..." URI) for locally-built
+    /// statuses. The backend's own favicon passes through when cached.
+    favicon: Option<String>,
 }
 
 fn now_secs() -> u64 {
@@ -92,6 +95,8 @@ async fn main() -> io::Result<()> {
     let startup_message = std::env::var("STARTUP_MESSAGE").unwrap_or_else(|_| {
         "&e&lServer is starting up!\n&7Please rejoin in a few seconds.".to_string()
     });
+    // Optional favicon for locally-built statuses (data:image/png;base64,...).
+    let favicon = std::env::var("FAVICON").ok().filter(|s| !s.is_empty());
     let bind_addr = format!("0.0.0.0:{}", port);
 
     println!("Starting proxy on {}", bind_addr);
@@ -115,6 +120,7 @@ async fn main() -> io::Result<()> {
         cached_status: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
         last_protocol: AtomicI64::new(0),
+        favicon,
     });
     let motd = Arc::new(motd);
     let motd_online = Arc::new(motd_online);
@@ -218,19 +224,26 @@ async fn handle_client(
         let cached = || state.cached_status.lock().ok().and_then(|c| c.clone());
 
         let json = if online > 0 {
-            // A player is connected: probe the backend for its real status
-            // (description/max/favicon) and cache it. Count comes from the proxy.
-            println!("[status] player online, probing backend (online={})", online);
-            match fetch_backend_status(backend_addr, &handshake).await {
-                Ok(backend_json) => {
-                    if let Ok(mut cache) = state.cached_status.lock() {
-                        *cache = Some(backend_json.clone());
+            // A player is connected. Serve from the cache when we have one (the
+            // join-time seed and the 60s keepalive keep it fresh) so list pings
+            // don't open a backend connection each; probe only when the cache is
+            // still empty. Count always comes from the proxy.
+            match cached() {
+                Some(backend_json) => build_online_json(&backend_json, motd_online, online),
+                None => {
+                    println!("[status] player online, no cache yet; probing backend");
+                    match fetch_backend_status(backend_addr, &handshake).await {
+                        Ok(backend_json) => {
+                            if let Ok(mut cache) = state.cached_status.lock() {
+                                *cache = Some(backend_json.clone());
+                            }
+                            build_online_json(&backend_json, motd_online, online)
+                        }
+                        Err(e) => {
+                            println!("[status] probe failed ({}), using config", e);
+                            online_or_offline_json(None, motd_online, online, &state, protocol, motd)
+                        }
                     }
-                    build_online_json(&backend_json, motd_online, online)
-                }
-                Err(e) => {
-                    println!("[status] probe failed ({}), using cache/config", e);
-                    online_or_offline_json(cached(), motd_online, online, &state, protocol, motd)
                 }
             }
         } else if since.is_some_and(|s| s < state.sleep_timeout) {
@@ -241,7 +254,7 @@ async fn handle_client(
             online_or_offline_json(cached(), motd_online, 0, &state, protocol, motd)
         } else {
             println!("[status] idle past window, serving offline MOTD");
-            offline_status_json(motd, protocol)
+            offline_status_json(motd, protocol, state.favicon.as_deref())
         };
 
         send_status(&mut client, &json).await?;
@@ -308,6 +321,23 @@ async fn handle_join(
         Ok(Ok(mut server)) => {
             // Backend already up: replay the handshake and proxy through.
             println!("[join] backend reachable, proxying");
+
+            // Seed the status cache in the background if it's empty, so the
+            // online MOTD shows the backend's real max/favicon right away
+            // instead of the MAX_PLAYERS fallback until the first keepalive.
+            if state.cached_status.lock().map(|c| c.is_none()).unwrap_or(false) {
+                let addr = backend_addr.to_string();
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let protocol = st.last_protocol.load(Ordering::Acquire) as i32;
+                    let hs = build_status_handshake(&addr, protocol);
+                    if let Ok(json) = fetch_backend_status(&addr, &hs).await {
+                        if let Ok(mut cache) = st.cached_status.lock() {
+                            cache.get_or_insert(json);
+                        }
+                    }
+                });
+            }
 
             // Single-session enforcement: if this account already has a live
             // session, cancel it and give the backend a moment to register the
@@ -508,13 +538,16 @@ async fn send_status(client: &mut TcpStream, json: &str) -> io::Result<()> {
 
 /// The local "sleeping" status JSON, echoing the client's protocol so it never
 /// shows as incompatible.
-fn offline_status_json(motd: &str, protocol: i32) -> String {
-    serde_json::json!({
+fn offline_status_json(motd: &str, protocol: i32, favicon: Option<&str>) -> String {
+    let mut status = serde_json::json!({
         "version": { "name": "sleeping", "protocol": protocol },
         "players": { "max": 0, "online": 0, "sample": [] },
         "description": motd_component(motd),
-    })
-    .to_string()
+    });
+    if let Some(icon) = favicon {
+        status["favicon"] = serde_json::Value::from(icon);
+    }
+    status.to_string()
 }
 
 /// Serve an online-looking status without probing the backend: prefer the cached
@@ -531,21 +564,30 @@ fn online_or_offline_json(
     if let Some(backend_json) = cached {
         build_online_json(&backend_json, motd_online, online)
     } else if let Some(text) = motd_online {
-        synth_online_json(text, state.max_players, online, protocol)
+        synth_online_json(text, state.max_players, online, protocol, state.favicon.as_deref())
     } else {
-        offline_status_json(offline_motd, protocol)
+        offline_status_json(offline_motd, protocol, state.favicon.as_deref())
     }
 }
 
 /// Synthesize an online status JSON purely from config (no backend data), for
 /// when the online MOTD is needed but nothing has been cached yet.
-fn synth_online_json(description: &str, max: u64, online: usize, protocol: i32) -> String {
-    serde_json::json!({
+fn synth_online_json(
+    description: &str,
+    max: u64,
+    online: usize,
+    protocol: i32,
+    favicon: Option<&str>,
+) -> String {
+    let mut status = serde_json::json!({
         "version": { "name": "online", "protocol": protocol },
         "players": { "max": max, "online": online, "sample": [] },
         "description": motd_component(description),
-    })
-    .to_string()
+    });
+    if let Some(icon) = favicon {
+        status["favicon"] = serde_json::Value::from(icon);
+    }
+    status.to_string()
 }
 
 /// Build an online status JSON from the backend's status. Optionally swaps the
@@ -766,6 +808,36 @@ fn parse_legacy_motd(motd: &str) -> serde_json::Value {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+
+        // <gradient:#RRGGBB:#RRGGBB[:#RRGGBB...]>text</gradient>
+        // Emits one run per character with interpolated hex colors. The text
+        // inside is taken literally (no & codes); formatting flags active at
+        // the tag (e.g. &l before it) are inherited by every character.
+        if c == '<' {
+            if let Some((stops, text, consumed)) = parse_gradient_tag(&chars[i..]) {
+                flush_run(&mut runs, &mut buf, &style);
+                let visible: Vec<char> = text.chars().collect();
+                let last = visible.len().saturating_sub(1).max(1) as f32;
+                for (idx, ch) in visible.iter().enumerate() {
+                    let mut run_style = Style {
+                        color: Some(gradient_color(&stops, idx as f32 / last)),
+                        ..Style::default()
+                    };
+                    run_style.bold = style.bold;
+                    run_style.italic = style.italic;
+                    run_style.underlined = style.underlined;
+                    run_style.strikethrough = style.strikethrough;
+                    run_style.obfuscated = style.obfuscated;
+                    let mut s = String::new();
+                    s.push(*ch);
+                    let mut one = s;
+                    flush_run(&mut runs, &mut one, &run_style);
+                }
+                i += consumed;
+                continue;
+            }
+        }
+
         if (c == '&' || c == '\u{00A7}') && i + 1 < chars.len() {
             let next = chars[i + 1];
 
@@ -812,6 +884,64 @@ fn parse_legacy_motd(motd: &str) -> serde_json::Value {
     }
     flush_run(&mut runs, &mut buf, &style);
     serde_json::json!({ "text": "", "extra": runs })
+}
+
+/// Try to parse a `<gradient:#RRGGBB[:#RRGGBB...]>text</gradient>` tag at the
+/// start of `chars`. Returns (color stops, inner text, chars consumed), or None
+/// if this isn't a well-formed gradient tag (caller then treats `<` literally).
+fn parse_gradient_tag(chars: &[char]) -> Option<(Vec<(u8, u8, u8)>, String, usize)> {
+    const OPEN: &str = "<gradient:";
+    const CLOSE: &str = "</gradient>";
+    let open: Vec<char> = OPEN.chars().collect();
+    if chars.len() < open.len() || chars[..open.len()] != open[..] {
+        return None;
+    }
+
+    // Header: colon-separated #RRGGBB stops up to '>'.
+    let header_end = chars.iter().position(|&c| c == '>')?;
+    let header: String = chars[open.len()..header_end].iter().collect();
+    let mut stops = Vec::new();
+    for part in header.split(':') {
+        let hex = part.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        stops.push((
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ));
+    }
+    if stops.is_empty() {
+        return None;
+    }
+
+    // Body: everything up to the closing tag.
+    let close: Vec<char> = CLOSE.chars().collect();
+    let body_start = header_end + 1;
+    let rel_close = chars[body_start..]
+        .windows(close.len())
+        .position(|w| *w == close[..])?;
+    let text: String = chars[body_start..body_start + rel_close].iter().collect();
+    let consumed = body_start + rel_close + close.len();
+    Some((stops, text, consumed))
+}
+
+/// Interpolate along multi-stop gradient colors at position t in [0, 1],
+/// returning a "#rrggbb" string.
+fn gradient_color(stops: &[(u8, u8, u8)], t: f32) -> String {
+    let t = t.clamp(0.0, 1.0);
+    if stops.len() == 1 {
+        let (r, g, b) = stops[0];
+        return format!("#{:02x}{:02x}{:02x}", r, g, b);
+    }
+    let scaled = t * (stops.len() - 1) as f32;
+    let idx = (scaled.floor() as usize).min(stops.len() - 2);
+    let frac = scaled - idx as f32;
+    let (r1, g1, b1) = stops[idx];
+    let (r2, g2, b2) = stops[idx + 1];
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * frac).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", lerp(r1, r2), lerp(g1, g2), lerp(b1, b2))
 }
 
 /// Read six `&<hex>` pairs after a `&x`, returning (hex string, index past them).
