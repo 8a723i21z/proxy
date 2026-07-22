@@ -24,6 +24,22 @@ const QUICK_CONNECT_SECS: u64 = 5;
 /// first and never fires "logged in from another location".
 const SESSION_HANDOFF_MS: u64 = 750;
 
+/// How often we nudge a held client while the backend boots. The vanilla client
+/// drops a login that receives nothing for ~30s, so stay well under that.
+const HOLD_PING_SECS: u64 = 12;
+
+/// How long to wait for the client's answer to a hold ping before concluding we
+/// can't hold it safely.
+const HOLD_ANSWER_SECS: u64 = 10;
+
+/// Channel used for the hold's Login Plugin Requests. A namespace no mod or
+/// client implements guarantees the answer is a plain "unknown channel".
+const HOLD_CHANNEL: &str = "sleepproxy:hold";
+
+/// First protocol version with Login Plugin Request (1.13). Older clients have
+/// no packet we can send mid-login, so they get the startup message instead.
+const PROTO_LOGIN_PLUGIN: i32 = 393;
+
 /// Maximum size of any pre-play packet we read and buffer ourselves (handshake,
 /// login start, status request). The largest legitimate one (login start with
 /// signature data) is ~2KB; this cap stops attackers making us allocate big
@@ -47,10 +63,14 @@ struct State {
     /// Seconds after the last player leaves during which the online MOTD keeps
     /// showing (from cache/config, with 0 players); after this it goes offline.
     sleep_timeout: u64,
-    /// Fallback max-players for the online MOTD when nothing has been cached yet.
+    /// Fallback max-players for any status we build ourselves (online MOTD and
+    /// the sleeping MOTD) when the backend's real cap hasn't been cached yet.
     max_players: u64,
     /// How long to keep retrying the backend connection on a join before giving up.
     connect_timeout: u64,
+    /// How long to hold a joining player on the connecting screen while the
+    /// backend boots, before falling back to the startup message. 0 disables.
+    join_hold: u64,
     /// True while a background task is booting the backend, to avoid piling up.
     waking: AtomicBool,
     /// Last status JSON fetched from the backend while a player was connected.
@@ -94,13 +114,19 @@ async fn main() -> io::Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(600);
     // How long to keep retrying the backend connection while it boots, on a join.
-    // Note: the Minecraft client's own login read-timeout (~30s) still applies,
-    // so a boot longer than that disconnects the first join regardless.
     let connect_timeout = std::env::var("CONNECT_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
-    // Fallback max-players shown on the online MOTD before anything is cached.
+    // How long a joining player is held on the connecting screen while the
+    // backend boots, instead of being bounced with the startup message. Set to 0
+    // to disconnect immediately (pre-hold behaviour).
+    let join_hold = std::env::var("JOIN_HOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(90);
+    // Fallback max-players shown on the online and sleeping MOTDs before the
+    // backend's real cap has been cached.
     let max_players = std::env::var("MAX_PLAYERS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -125,6 +151,10 @@ async fn main() -> io::Result<()> {
     println!("Online MOTD window: {}s", sleep_timeout);
     println!("Connect timeout: {}s", connect_timeout);
     println!("Quick-connect window: {}s", QUICK_CONNECT_SECS);
+    match join_hold {
+        0 => println!("Join hold: off (cold joins get the startup message)"),
+        secs => println!("Join hold: up to {}s on the connecting screen", secs),
+    }
     match &motd_online {
         Some(_) => println!("Online MOTD: static (MOTD_ONLINE set)"),
         None => println!("Online MOTD: live passthrough from backend"),
@@ -137,6 +167,7 @@ async fn main() -> io::Result<()> {
         sleep_timeout,
         max_players,
         connect_timeout,
+        join_hold,
         waking: AtomicBool::new(false),
         cached_status: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
@@ -276,7 +307,7 @@ async fn handle_client(
     // close instead of misparsing it as a VarInt.
     if first == 0xFE {
         let online = state.active.load(Ordering::Acquire);
-        let max = state.max_players;
+        let max = display_max(&state);
         let _ = send_legacy_status(&mut client, motd, online, max).await;
         return Ok(());
     }
@@ -353,7 +384,7 @@ async fn handle_client(
             online_or_offline_json(cached(), motd_online, 0, &state, protocol, motd)
         } else {
             println!("[status] idle past window, serving offline MOTD");
-            offline_status_json(motd, protocol, state.favicon.as_deref())
+            offline_status_json(motd, protocol, display_max(&state), state.favicon.as_deref())
         };
 
         send_status(&mut client, &json).await?;
@@ -396,6 +427,7 @@ async fn handle_client(
         &handshake,
         &login_start,
         username.as_deref(),
+        protocol,
         &state,
         startup_message,
     )
@@ -410,169 +442,216 @@ async fn handle_client(
 }
 
 /// Handle a join. If the backend is reachable quickly, proxy straight through.
-/// Otherwise trigger its boot in the background and politely disconnect the
-/// player with a "starting up" message so they don't hit the client timeout.
+/// Otherwise trigger its boot and hold the player on the connecting screen until
+/// it comes up (see `hold_for_backend`), falling back to a polite "starting up"
+/// disconnect if it never does, or if the client is too old to be held.
 async fn handle_join(
     mut client: TcpStream,
     backend_addr: &str,
     handshake: &[u8],
     login_start: &[u8],
     username: Option<&str>,
+    protocol: i32,
     state: &Arc<State>,
     startup_message: &str,
 ) -> io::Result<()> {
-    match timeout(Duration::from_secs(QUICK_CONNECT_SECS), TcpStream::connect(backend_addr)).await {
-        Ok(Ok(mut server)) => {
-            // Backend already up: replay the handshake and proxy through.
-            println!("[join] backend reachable, proxying");
-            server.set_nodelay(true).ok();
-
-            // Seed the status cache in the background if it's empty, so the
-            // online MOTD shows the backend's real max/favicon right away
-            // instead of the MAX_PLAYERS fallback until the first keepalive.
-            if state.cached_status.lock().map(|c| c.is_none()).unwrap_or(false) {
-                let addr = backend_addr.to_string();
-                let st = state.clone();
-                tokio::spawn(async move {
-                    let protocol = st.last_protocol.load(Ordering::Acquire) as i32;
-                    let hs = build_status_handshake(&addr, protocol);
-                    if let Ok(json) = fetch_backend_status(&addr, &hs).await {
-                        if let Ok(mut cache) = st.cached_status.lock() {
-                            cache.get_or_insert(json);
-                        }
-                    }
-                });
-            }
-
-            // Single-session enforcement: if this account already has a live
-            // session, cancel it and give the backend a moment to register the
-            // disconnect BEFORE this login lands — so the server never fires
-            // "logged in from another location" when a player reconnects.
-            let cancel = Arc::new(Notify::new());
-            if let Some(name) = username {
-                let previous = state
-                    .sessions
-                    .lock()
-                    .ok()
-                    .and_then(|mut sessions| sessions.insert(name.to_string(), cancel.clone()));
-                if let Some(prev) = previous {
-                    println!("[join] {} reconnected; closing previous session first", name);
-                    prev.notify_one();
-                    sleep(Duration::from_millis(SESSION_HANDOFF_MS)).await;
-                }
-            }
-
-            // The backend never saw the handshake or login start we consumed.
-            server.write_all(&frame(handshake)).await?;
-            server.write_all(&frame(login_start)).await?;
-
-            // Pipe both directions, tearing down BOTH when either side ends OR
-            // this session is superseded by a newer login for the same account.
-            // (copy_bidirectional would keep the other half-open until both
-            // sides close, leaving the backend session and our `active` count
-            // hanging after a client drops.)
-            let name = username.unwrap_or("<unknown>");
-            let started = std::time::Instant::now();
-            let (mut cr, mut cw) = client.split();
-            let (mut sr, mut sw) = server.split();
-            let client_to_server = async {
-                let r = io::copy(&mut cr, &mut sw).await;
-                let _ = sw.shutdown().await;
-                r
-            };
-            let server_to_client = async {
-                let r = io::copy(&mut sr, &mut cw).await;
-                let _ = cw.shutdown().await;
-                r
-            };
-            enum SessionEnd {
-                Client(io::Result<u64>),
-                Backend(io::Result<u64>),
-                Superseded,
-            }
-            let end = tokio::select! {
-                r = client_to_server => SessionEnd::Client(r),
-                r = server_to_client => SessionEnd::Backend(r),
-                _ = cancel.notified() => SessionEnd::Superseded,
-            };
-
-            // Log exactly which leg ended the session and how, so a disconnect
-            // can be attributed to the client<->proxy path or the
-            // proxy<->backend path from this one line.
-            let secs = started.elapsed().as_secs();
-            match &end {
-                SessionEnd::Client(Ok(n)) => println!(
-                    "[conn] {}: client closed cleanly after {}s ({} bytes c->s); closing backend",
-                    name, secs, n
-                ),
-                SessionEnd::Client(Err(e)) => println!(
-                    "[conn] {}: CLIENT-LEG error after {}s: {} (drop came from client<->proxy path)",
-                    name, secs, e
-                ),
-                SessionEnd::Backend(Ok(n)) => println!(
-                    "[conn] {}: backend closed cleanly after {}s ({} bytes s->c); closing client",
-                    name, secs, n
-                ),
-                SessionEnd::Backend(Err(e)) => println!(
-                    "[conn] {}: BACKEND-LEG error after {}s: {} (drop came from proxy<->backend path)",
-                    name, secs, e
-                ),
-                SessionEnd::Superseded => println!(
-                    "[conn] {}: superseded by a newer session after {}s; closing both",
-                    name, secs
-                ),
-            }
-
-            // Graceful teardown. Half-close our write side toward both peers
-            // (FIN), then briefly drain leftover inbound bytes. Dropping a
-            // socket with unread data in its buffer makes the kernel send RST,
-            // and an RST discards data still in flight to the peer — e.g. the
-            // server's final disconnect screen — showing up client-side as
-            // "Connection reset by peer" instead of a clean disconnect.
-            let _ = client.shutdown().await;
-            let _ = server.shutdown().await;
-            let _ = timeout(Duration::from_millis(500), async {
-                let mut cbuf = [0u8; 8192];
-                let mut sbuf = [0u8; 8192];
-                let drain_client = async {
-                    loop {
-                        match client.read(&mut cbuf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
-                        }
-                    }
-                };
-                let drain_server = async {
-                    loop {
-                        match server.read(&mut sbuf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
-                        }
-                    }
-                };
-                tokio::join!(drain_client, drain_server);
-            })
+    if let Ok(Ok(server)) =
+        timeout(Duration::from_secs(QUICK_CONNECT_SECS), TcpStream::connect(backend_addr)).await
+    {
+        println!("[join] backend reachable, proxying");
+        return proxy_session(client, server, backend_addr, handshake, login_start, username, state)
             .await;
+    }
 
-            // Deregister, but only if we're still the current session for this
-            // name (a newer session may have replaced our map entry already).
-            if let Some(name) = username {
-                if let Ok(mut sessions) = state.sessions.lock() {
-                    if sessions.get(name).is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
-                        sessions.remove(name);
-                    }
+    // Backend asleep or still booting: start the boot, then try to keep the
+    // player parked on the connecting screen until it finishes.
+    println!("[join] backend not ready, waking it");
+    ensure_waking(backend_addr, state);
+
+    if state.join_hold > 0 {
+        if protocol >= PROTO_LOGIN_PLUGIN {
+            match hold_for_backend(&mut client, backend_addr, state.join_hold).await {
+                Ok(Some(server)) => {
+                    return proxy_session(
+                        client,
+                        server,
+                        backend_addr,
+                        handshake,
+                        login_start,
+                        username,
+                        state,
+                    )
+                    .await;
+                }
+                // Never came up (or we lost confidence in the hold): fall through
+                // to the startup message so the player still gets an explanation.
+                Ok(None) => println!("[hold] giving up, sending startup message"),
+                // Client is gone; writing anything more is pointless.
+                Err(e) => {
+                    println!("[hold] client left during hold: {}", e);
+                    return Ok(());
                 }
             }
-            Ok(())
-        }
-        _ => {
-            // Backend asleep/booting: kick off the boot and ask the player to rejoin.
-            println!("[join] backend not ready, waking it and asking client to rejoin");
-            ensure_waking(backend_addr, state);
-            send_login_disconnect(&mut client, startup_message).await
+        } else {
+            println!("[hold] client protocol {} is pre-1.13, can't be held", protocol);
         }
     }
+
+    send_login_disconnect(&mut client, startup_message).await
 }
+
+/// Replay the consumed handshake/login start to a live backend and pipe the two
+/// sockets together for the rest of the session.
+async fn proxy_session(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    backend_addr: &str,
+    handshake: &[u8],
+    login_start: &[u8],
+    username: Option<&str>,
+    state: &Arc<State>,
+) -> io::Result<()> {
+    server.set_nodelay(true).ok();
+
+    // Seed the status cache in the background if it's empty, so the online MOTD
+    // shows the backend's real max/favicon right away instead of the MAX_PLAYERS
+    // fallback until the first keepalive.
+    if state.cached_status.lock().map(|c| c.is_none()).unwrap_or(false) {
+        let addr = backend_addr.to_string();
+        let st = state.clone();
+        tokio::spawn(async move {
+            let protocol = st.last_protocol.load(Ordering::Acquire) as i32;
+            let hs = build_status_handshake(&addr, protocol);
+            if let Ok(json) = fetch_backend_status(&addr, &hs).await {
+                if let Ok(mut cache) = st.cached_status.lock() {
+                    cache.get_or_insert(json);
+                }
+            }
+        });
+    }
+
+    // Single-session enforcement: if this account already has a live
+    // session, cancel it and give the backend a moment to register the
+    // disconnect BEFORE this login lands — so the server never fires
+    // "logged in from another location" when a player reconnects.
+    let cancel = Arc::new(Notify::new());
+    if let Some(name) = username {
+        let previous = state
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.insert(name.to_string(), cancel.clone()));
+        if let Some(prev) = previous {
+            println!("[join] {} reconnected; closing previous session first", name);
+            prev.notify_one();
+            sleep(Duration::from_millis(SESSION_HANDOFF_MS)).await;
+        }
+    }
+
+    // The backend never saw the handshake or login start we consumed.
+    server.write_all(&frame(handshake)).await?;
+    server.write_all(&frame(login_start)).await?;
+
+    // Pipe both directions, tearing down BOTH when either side ends OR
+    // this session is superseded by a newer login for the same account.
+    // (copy_bidirectional would keep the other half-open until both
+    // sides close, leaving the backend session and our `active` count
+    // hanging after a client drops.)
+    let name = username.unwrap_or("<unknown>");
+    let started = std::time::Instant::now();
+    let (mut cr, mut cw) = client.split();
+    let (mut sr, mut sw) = server.split();
+    let client_to_server = async {
+        let r = io::copy(&mut cr, &mut sw).await;
+        let _ = sw.shutdown().await;
+        r
+    };
+    let server_to_client = async {
+        let r = io::copy(&mut sr, &mut cw).await;
+        let _ = cw.shutdown().await;
+        r
+    };
+    enum SessionEnd {
+        Client(io::Result<u64>),
+        Backend(io::Result<u64>),
+        Superseded,
+    }
+    let end = tokio::select! {
+        r = client_to_server => SessionEnd::Client(r),
+        r = server_to_client => SessionEnd::Backend(r),
+        _ = cancel.notified() => SessionEnd::Superseded,
+    };
+
+    // Log exactly which leg ended the session and how, so a disconnect
+    // can be attributed to the client<->proxy path or the
+    // proxy<->backend path from this one line.
+    let secs = started.elapsed().as_secs();
+    match &end {
+        SessionEnd::Client(Ok(n)) => println!(
+            "[conn] {}: client closed cleanly after {}s ({} bytes c->s); closing backend",
+            name, secs, n
+        ),
+        SessionEnd::Client(Err(e)) => println!(
+            "[conn] {}: CLIENT-LEG error after {}s: {} (drop came from client<->proxy path)",
+            name, secs, e
+        ),
+        SessionEnd::Backend(Ok(n)) => println!(
+            "[conn] {}: backend closed cleanly after {}s ({} bytes s->c); closing client",
+            name, secs, n
+        ),
+        SessionEnd::Backend(Err(e)) => println!(
+            "[conn] {}: BACKEND-LEG error after {}s: {} (drop came from proxy<->backend path)",
+            name, secs, e
+        ),
+        SessionEnd::Superseded => println!(
+            "[conn] {}: superseded by a newer session after {}s; closing both",
+            name, secs
+        ),
+    }
+
+    // Graceful teardown. Half-close our write side toward both peers
+    // (FIN), then briefly drain leftover inbound bytes. Dropping a
+    // socket with unread data in its buffer makes the kernel send RST,
+    // and an RST discards data still in flight to the peer — e.g. the
+    // server's final disconnect screen — showing up client-side as
+    // "Connection reset by peer" instead of a clean disconnect.
+    let _ = client.shutdown().await;
+    let _ = server.shutdown().await;
+    let _ = timeout(Duration::from_millis(500), async {
+        let mut cbuf = [0u8; 8192];
+        let mut sbuf = [0u8; 8192];
+        let drain_client = async {
+            loop {
+                match client.read(&mut cbuf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        let drain_server = async {
+            loop {
+                match server.read(&mut sbuf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        tokio::join!(drain_client, drain_server);
+    })
+    .await;
+
+    // Deregister, but only if we're still the current session for this
+    // name (a newer session may have replaced our map entry already).
+    if let Some(name) = username {
+        if let Ok(mut sessions) = state.sessions.lock() {
+            if sessions.get(name).is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
+                sessions.remove(name);
+            }
+        }
+    }
+    Ok(())
+}
+
 
 /// Parse the username out of a Login Start packet (its first field is always a
 /// String, across protocol versions). Returns None if it doesn't look like one.
@@ -605,6 +684,95 @@ fn ensure_waking(backend_addr: &str, state: &Arc<State>) {
         }
         state.waking.store(false, Ordering::Release);
     });
+}
+
+/// Hold a joining client on the connecting screen while the backend boots,
+/// instead of bouncing it with "rejoin in a few seconds".
+///
+/// The vanilla client kills a login that receives nothing for ~30s, which is
+/// shorter than a cold start, so simply waiting would time out. Any inbound
+/// packet resets that timer, so we send a Login Plugin Request (1.13+) on a
+/// private channel every `HOLD_PING_SECS` and swallow the client's "unknown
+/// channel" answer. None of that advances the login state machine: when the
+/// backend finally accepts, the caller replays the handshake and login start and
+/// the real login runs end-to-end — encryption and Mojang auth included, exactly
+/// as if the player had connected to an already-running server.
+///
+/// Returns the backend connection once it accepts one, `Ok(None)` if it never
+/// did within `hold_secs` (caller should send the startup message), or `Err` if
+/// the client hung up (caller should just close).
+async fn hold_for_backend(
+    client: &mut TcpStream,
+    backend_addr: &str,
+    hold_secs: u64,
+) -> io::Result<Option<TcpStream>> {
+    let started = Instant::now();
+    let hold = Duration::from_secs(hold_secs);
+    let mut last_ping = Instant::now();
+    let mut message_id: u32 = 0;
+
+    println!("[hold] holding client up to {}s while the backend boots", hold_secs);
+
+    while started.elapsed() < hold {
+        if let Ok(Ok(server)) =
+            timeout(Duration::from_secs(2), TcpStream::connect(backend_addr)).await
+        {
+            println!(
+                "[hold] backend accepted after {}s, resuming this player's login",
+                started.elapsed().as_secs()
+            );
+            return Ok(Some(server));
+        }
+
+        if last_ping.elapsed() >= Duration::from_secs(HOLD_PING_SECS) {
+            message_id = message_id.wrapping_add(1);
+            // A failed write means the client is gone: stop holding for a ghost.
+            send_login_plugin_request(client, message_id).await?;
+            // Consume the answer before looping. The login stream has to be clean
+            // the moment we hand it to the backend, or the server sees an
+            // unexpected packet and kicks the player.
+            if !read_query_answer(client).await? {
+                println!("[hold] client didn't answer the hold ping");
+                return Ok(None);
+            }
+            last_ping = Instant::now();
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    println!("[hold] backend still down after {}s", hold_secs);
+    Ok(None)
+}
+
+/// Send a clientbound Login Plugin Request (0x04) on a channel nothing
+/// implements. Vanilla answers "unknown channel" and stays put in the login
+/// phase, which is exactly what the hold needs: inbound traffic that resets the
+/// client's read timeout without changing any state.
+async fn send_login_plugin_request(client: &mut TcpStream, message_id: u32) -> io::Result<()> {
+    let mut payload = vec![0x04u8]; // Login Plugin Request packet id
+    payload.extend_from_slice(&encode_varint(message_id));
+    payload.extend_from_slice(&frame(HOLD_CHANNEL.as_bytes())); // Channel: Identifier
+    // Data is the rest of the packet, and we send none.
+    client.write_all(&frame(&payload)).await
+}
+
+/// Wait for the client's answer to a hold ping and discard it. `Ok(true)` means
+/// it answered and the stream is back at a packet boundary; `Ok(false)` means it
+/// didn't in time, so the hold can't safely continue (the read may have stopped
+/// mid-packet, making the stream unsafe to splice onto the backend — the caller
+/// only writes a disconnect after this); `Err` means the client is gone.
+async fn read_query_answer(client: &mut TcpStream) -> io::Result<bool> {
+    match timeout(
+        Duration::from_secs(HOLD_ANSWER_SECS),
+        read_packet_max(client, MAX_PREPLAY_PACKET),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Send a clientbound Login Disconnect (0x00) with a styled reason, so the
@@ -696,17 +864,33 @@ fn plain_motd_text(motd: &str) -> String {
 }
 
 /// The local "sleeping" status JSON, echoing the client's protocol so it never
-/// shows as incompatible.
-fn offline_status_json(motd: &str, protocol: i32, favicon: Option<&str>) -> String {
+/// shows as incompatible. `max` is advertised as the slot cap so a sleeping
+/// server reads as "0 / 20" in the list rather than a suspicious "0 / 0".
+fn offline_status_json(motd: &str, protocol: i32, max: u64, favicon: Option<&str>) -> String {
     let mut status = serde_json::json!({
         "version": { "name": "sleeping", "protocol": protocol },
-        "players": { "max": 0, "online": 0, "sample": [] },
+        "players": { "max": max, "online": 0, "sample": [] },
         "description": motd_component(motd),
     });
     if let Some(icon) = favicon {
         status["favicon"] = serde_json::Value::from(icon);
     }
     status.to_string()
+}
+
+/// Max-players to advertise on any status we build ourselves: the backend's own
+/// cap from the last cached status when we have one, else the MAX_PLAYERS
+/// fallback. Never 0, so the slot count stays plausible while the backend sleeps.
+fn display_max(state: &State) -> u64 {
+    state
+        .cached_status
+        .lock()
+        .ok()
+        .and_then(|cache| cache.clone())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|value| value["players"]["max"].as_u64())
+        .filter(|max| *max > 0)
+        .unwrap_or(state.max_players)
 }
 
 /// Serve an online-looking status without probing the backend: prefer the cached
@@ -723,9 +907,9 @@ fn online_or_offline_json(
     if let Some(backend_json) = cached {
         build_online_json(&backend_json, motd_online, online)
     } else if let Some(text) = motd_online {
-        synth_online_json(text, state.max_players, online, protocol, state.favicon.as_deref())
+        synth_online_json(text, display_max(state), online, protocol, state.favicon.as_deref())
     } else {
-        offline_status_json(offline_motd, protocol, state.favicon.as_deref())
+        offline_status_json(offline_motd, protocol, display_max(state), state.favicon.as_deref())
     }
 }
 
